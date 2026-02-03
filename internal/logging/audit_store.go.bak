@@ -1,0 +1,503 @@
+package logging
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+// AuditStore defines the interface for storing audit events
+type AuditStore interface {
+	// SaveEvent saves a single audit event
+	SaveEvent(event *AuditEvent) error
+
+	// SaveEventAsync saves a single audit event asynchronously
+	SaveEventAsync(event *AuditEvent)
+
+	// QueryEvents queries audit events with filters
+	QueryEvents(ctx context.Context, filters AuditQueryFilters) ([]*AuditEvent, error)
+
+	// GetEventByID retrieves a single event by ID
+	GetEventByID(ctx context.Context, id string) (*AuditEvent, error)
+
+	// CountEvents counts events matching the filters
+	CountEvents(ctx context.Context, filters AuditQueryFilters) (int, error)
+
+	// CleanupOldEvents removes events older than the specified duration
+	CleanupOldEvents(ctx context.Context, olderThan time.Duration) (int64, error)
+
+	// Close gracefully shuts down the store
+	Close() error
+}
+
+// AuditQueryFilters defines filters for querying audit events
+type AuditQueryFilters struct {
+	EventType string    `json:"event_type,omitempty"`
+	Severity  string    `json:"severity,omitempty"`
+	UserID    string    `json:"user_id,omitempty"`
+	IPAddress string    `json:"ip_address,omitempty"`
+	Action    string    `json:"action,omitempty"`
+	Status    string    `json:"status,omitempty"`
+	Resource  string    `json:"resource,omitempty"`
+	StartTime time.Time `json:"start_time,omitempty"`
+	EndTime   time.Time `json:"end_time,omitempty"`
+	Limit     int       `json:"limit,omitempty"`
+	Offset    int       `json:"offset,omitempty"`
+	OrderBy   string    `json:"order_by,omitempty"`
+	OrderDesc bool      `json:"order_desc,omitempty"`
+}
+
+// SQLiteAuditStore implements AuditStore using SQLite
+type SQLiteAuditStore struct {
+	mu     sync.RWMutex
+	db     *sql.DB
+	logger *Logger
+
+	// Retention settings
+	retentionDays int
+	cleanupTicker *time.Ticker
+	cleanupDone   chan struct{}
+
+	// Async queue
+	eventChan chan *AuditEvent
+}
+
+// NewSQLiteAuditStore creates a new SQLite audit store
+func NewSQLiteAuditStore(dbPath string) (*SQLiteAuditStore, error) {
+	return NewSQLiteAuditStoreWithRetention(dbPath, 90) // Default 90 days retention
+}
+
+// NewSQLiteAuditStoreWithRetention creates a new SQLite audit store with custom retention
+func NewSQLiteAuditStoreWithRetention(dbPath string, retentionDays int) (*SQLiteAuditStore, error) {
+	// Create directory if it doesn't exist
+	dir := filepath.Dir(dbPath)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create database directory: %w", err)
+		}
+	}
+
+	// Open database with WAL mode enabled
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)&_pragma=cache_size(2000)&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+
+	// Test connection
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to ping database: %w", err)
+	}
+
+	// Run migrations
+	if err := runAuditMigrations(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to run audit migrations: %w", err)
+	}
+
+	s := &SQLiteAuditStore{
+		db:            db,
+		logger:        NewLogger(),
+		retentionDays: retentionDays,
+		cleanupDone:   make(chan struct{}),
+		eventChan:     make(chan *AuditEvent, 1000), // Buffer for async events
+	}
+
+	// Start async event processor
+	go s.processEvents()
+
+	// Start retention cleanup goroutine if retention is enabled
+	if retentionDays > 0 {
+		s.startCleanup()
+	}
+
+	return s, nil
+}
+
+// runAuditMigrations creates the audit_log table and indexes
+func runAuditMigrations(db *sql.DB) error {
+	// Create audit_log table
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS audit_log (
+			id TEXT PRIMARY KEY,
+			timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+			event_type TEXT NOT NULL,
+			severity TEXT NOT NULL,
+			user_id TEXT,
+			ip_address TEXT,
+			action TEXT NOT NULL,
+			resource TEXT,
+			status TEXT,
+			details TEXT,
+			error_message TEXT
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create audit_log table: %w", err)
+	}
+
+	// Create indexes for common queries
+	indexes := []string{
+		"CREATE INDEX IF NOT EXISTS idx_audit_log_timestamp ON audit_log(timestamp DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_audit_log_event_type ON audit_log(event_type)",
+		"CREATE INDEX IF NOT EXISTS idx_audit_log_user_id ON audit_log(user_id)",
+		"CREATE INDEX IF NOT EXISTS idx_audit_log_ip_address ON audit_log(ip_address)",
+		"CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action)",
+		"CREATE INDEX IF NOT EXISTS idx_audit_log_status ON audit_log(status)",
+		"CREATE INDEX IF NOT EXISTS idx_audit_log_resource ON audit_log(resource)",
+	}
+
+	for _, idx := range indexes {
+		if _, err := db.Exec(idx); err != nil {
+			return fmt.Errorf("failed to create index: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// startCleanup starts the retention cleanup goroutine
+func (s *SQLiteAuditStore) startCleanup() {
+	s.cleanupTicker = time.NewTicker(24 * time.Hour) // Run cleanup once per day
+	go func() {
+		// Run initial cleanup
+		s.cleanupOldData()
+
+		for {
+			select {
+			case <-s.cleanupTicker.C:
+				s.cleanupOldData()
+			case <-s.cleanupDone:
+				return
+			}
+		}
+	}()
+}
+
+// cleanupOldData removes old audit events based on retention policy
+func (s *SQLiteAuditStore) cleanupOldData() {
+	if s.retentionDays <= 0 {
+		return
+	}
+
+	cutoff := time.Now().AddDate(0, -s.retentionDays, 0)
+	result, err := s.db.Exec("DELETE FROM audit_log WHERE timestamp < ?", cutoff)
+	if err != nil {
+		s.logger.Error("audit log cleanup failed", "error", err.Error())
+		return
+	}
+
+	rows, _ := result.RowsAffected()
+	if rows > 0 {
+		s.logger.Info("audit log cleanup completed", "deleted_rows", rows, "retention_days", s.retentionDays)
+	}
+}
+
+// processEvents handles async event processing
+func (s *SQLiteAuditStore) processEvents() {
+	for event := range s.eventChan {
+		if err := s.saveEventInternal(event); err != nil {
+			s.logger.Error("failed to save async audit event", "error", err.Error(), "event_id", event.ID)
+		}
+	}
+}
+
+// SaveEvent saves a single audit event
+func (s *SQLiteAuditStore) SaveEvent(event *AuditEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveEventInternal(event)
+}
+
+// saveEventInternal saves an audit event (must be called with lock held)
+func (s *SQLiteAuditStore) saveEventInternal(event *AuditEvent) error {
+	detailsJSON, _ := json.Marshal(event.Details)
+
+	_, err := s.db.Exec(`
+		INSERT INTO audit_log (id, timestamp, event_type, severity, user_id, ip_address, action, resource, status, details, error_message)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			timestamp = excluded.timestamp,
+			event_type = excluded.event_type,
+			severity = excluded.severity,
+			user_id = excluded.user_id,
+			ip_address = excluded.ip_address,
+			action = excluded.action,
+			resource = excluded.resource,
+			status = excluded.status,
+			details = excluded.details,
+			error_message = excluded.error_message
+	`,
+		event.ID,
+		event.Timestamp,
+		string(event.EventType),
+		string(event.Severity),
+		event.UserID,
+		event.IPAddress,
+		event.Action,
+		event.Resource,
+		string(event.Status),
+		detailsJSON,
+		event.ErrorMessage,
+	)
+
+	if err != nil {
+		return fmt.Errorf("failed to save audit event: %w", err)
+	}
+
+	return nil
+}
+
+// SaveEventAsync saves an audit event asynchronously
+func (s *SQLiteAuditStore) SaveEventAsync(event *AuditEvent) {
+	select {
+	case s.eventChan <- event:
+	default:
+		// Channel is full, log warning and drop event
+		s.logger.Warn("audit event channel full, dropping event", "event_id", event.ID)
+	}
+}
+
+// QueryEvents queries audit events with filters
+func (s *SQLiteAuditStore) QueryEvents(ctx context.Context, filters AuditQueryFilters) ([]*AuditEvent, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := "SELECT id, timestamp, event_type, severity, user_id, ip_address, action, resource, status, details, error_message FROM audit_log WHERE 1=1"
+	args := []interface{}{}
+
+	if filters.EventType != "" {
+		query += " AND event_type = ?"
+		args = append(args, filters.EventType)
+	}
+
+	if filters.Severity != "" {
+		query += " AND severity = ?"
+		args = append(args, filters.Severity)
+	}
+
+	if filters.UserID != "" {
+		query += " AND user_id = ?"
+		args = append(args, filters.UserID)
+	}
+
+	if filters.IPAddress != "" {
+		query += " AND ip_address = ?"
+		args = append(args, filters.IPAddress)
+	}
+
+	if filters.Action != "" {
+		query += " AND action LIKE ?"
+		args = append(args, "%"+filters.Action+"%")
+	}
+
+	if filters.Status != "" {
+		query += " AND status = ?"
+		args = append(args, filters.Status)
+	}
+
+	if filters.Resource != "" {
+		query += " AND resource = ?"
+		args = append(args, filters.Resource)
+	}
+
+	if !filters.StartTime.IsZero() {
+		query += " AND timestamp >= ?"
+		args = append(args, filters.StartTime)
+	}
+
+	if !filters.EndTime.IsZero() {
+		query += " AND timestamp <= ?"
+		args = append(args, filters.EndTime)
+	}
+
+	// Order by
+	orderBy := "timestamp"
+	if filters.OrderBy != "" {
+		orderBy = filters.OrderBy
+	}
+	query += " ORDER BY " + orderBy
+	if filters.OrderDesc {
+		query += " DESC"
+	} else {
+		query += " ASC"
+	}
+
+	// Limit and offset
+	limit := 100
+	if filters.Limit > 0 {
+		limit = filters.Limit
+	}
+	query += fmt.Sprintf(" LIMIT %d", limit)
+
+	if filters.Offset > 0 {
+		query += fmt.Sprintf(" OFFSET %d", filters.Offset)
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query audit events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []*AuditEvent
+	for rows.Next() {
+		var event AuditEvent
+		var detailsJSON sql.NullString
+
+		if err := rows.Scan(
+			&event.ID,
+			&event.Timestamp,
+			&event.EventType,
+			&event.Severity,
+			&event.UserID,
+			&event.IPAddress,
+			&event.Action,
+			&event.Resource,
+			&event.Status,
+			&detailsJSON,
+			&event.ErrorMessage,
+		); err != nil {
+			continue
+		}
+
+		if detailsJSON.Valid {
+			json.Unmarshal([]byte(detailsJSON.String), &event.Details)
+		}
+
+		events = append(events, &event)
+	}
+
+	return events, nil
+}
+
+// GetEventByID retrieves a single event by ID
+func (s *SQLiteAuditStore) GetEventByID(ctx context.Context, id string) (*AuditEvent, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var event AuditEvent
+	var detailsJSON sql.NullString
+
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, timestamp, event_type, severity, user_id, ip_address, action, resource, status, details, error_message
+		FROM audit_log WHERE id = ?
+	`, id).Scan(
+		&event.ID,
+		&event.Timestamp,
+		&event.EventType,
+		&event.Severity,
+		&event.UserID,
+		&event.IPAddress,
+		&event.Action,
+		&event.Resource,
+		&event.Status,
+		&detailsJSON,
+		&event.ErrorMessage,
+	)
+
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to get audit event: %w", err)
+	}
+
+	if detailsJSON.Valid {
+		json.Unmarshal([]byte(detailsJSON.String), &event.Details)
+	}
+
+	return &event, nil
+}
+
+// CountEvents counts events matching the filters
+func (s *SQLiteAuditStore) CountEvents(ctx context.Context, filters AuditQueryFilters) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	query := "SELECT COUNT(*) FROM audit_log WHERE 1=1"
+	args := []interface{}{}
+
+	if filters.EventType != "" {
+		query += " AND event_type = ?"
+		args = append(args, filters.EventType)
+	}
+
+	if filters.Severity != "" {
+		query += " AND severity = ?"
+		args = append(args, filters.Severity)
+	}
+
+	if filters.UserID != "" {
+		query += " AND user_id = ?"
+		args = append(args, filters.UserID)
+	}
+
+	if filters.Status != "" {
+		query += " AND status = ?"
+		args = append(args, filters.Status)
+	}
+
+	if !filters.StartTime.IsZero() {
+		query += " AND timestamp >= ?"
+		args = append(args, filters.StartTime)
+	}
+
+	if !filters.EndTime.IsZero() {
+		query += " AND timestamp <= ?"
+		args = append(args, filters.EndTime)
+	}
+
+	var count int
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count audit events: %w", err)
+	}
+
+	return count, nil
+}
+
+// CleanupOldEvents removes events older than the specified duration
+func (s *SQLiteAuditStore) CleanupOldEvents(ctx context.Context, olderThan time.Duration) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cutoff := time.Now().Add(-olderThan)
+	result, err := s.db.ExecContext(ctx, "DELETE FROM audit_log WHERE timestamp < ?", cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("failed to cleanup old audit events: %w", err)
+	}
+
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get affected rows: %w", err)
+	}
+
+	s.logger.Info("manual audit log cleanup completed", "deleted_rows", rows)
+	return rows, nil
+}
+
+// Close gracefully shuts down the store
+func (s *SQLiteAuditStore) Close() error {
+	// Stop cleanup goroutine
+	if s.cleanupTicker != nil {
+		s.cleanupTicker.Stop()
+		close(s.cleanupDone)
+	}
+
+	// Close event channel
+	close(s.eventChan)
+
+	// Close database connection
+	if s.db != nil {
+		return s.db.Close()
+	}
+	return nil
+}

@@ -1,0 +1,23 @@
+# Binaries
+quotaguard
+
+# Data
+data/
+*.db
+*.db-*
+
+# Logs
+*.log
+nohup.out
+
+# Coverage
+coverage.out
+coverage.html
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Go
+*.test

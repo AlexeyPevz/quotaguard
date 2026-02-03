@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  quotaguard:
+    build: .
+    container_name: quotaguard
+    ports:
+      - "8318:8318"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - /opt/cliproxyplus/auths:/app/auths:ro
+      - quotaguard_data:/app/data
+    environment:
+      - QUOTAGUARD_CLIPROXY_AUTH_PATH=/app/auths
+      - QUOTAGUARD_DB_PATH=/app/data/quotaguard.db
+      - QUOTAGUARD_CONFIG_PATH=/app/config.yaml
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      cliproxy:
+        condition: service_started
+
+  cliproxy:
+    image: cliproxy/cliproxy-plus
+    container_name: cliproxy
+    ports:
+      - "4112:4112"
+    volumes:
+      - /opt/cliproxyplus/auths:/app/auths:ro
+      - /opt/cliproxyplus/config.yaml:/app/config.yaml:ro
+    restart: unless-stopped
+
+volumes:
+  quotaguard_data:

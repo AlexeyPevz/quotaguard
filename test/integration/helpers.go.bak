@@ -1,0 +1,350 @@
+package integration
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/quotaguard/quotaguard/internal/api"
+	"github.com/quotaguard/quotaguard/internal/collector"
+	"github.com/quotaguard/quotaguard/internal/config"
+	"github.com/quotaguard/quotaguard/internal/models"
+	"github.com/quotaguard/quotaguard/internal/reservation"
+	"github.com/quotaguard/quotaguard/internal/router"
+	"github.com/quotaguard/quotaguard/internal/store"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestServer holds the test server and its dependencies
+type TestServer struct {
+	Engine      *gin.Engine
+	Store       *store.SQLiteStore
+	Server      *api.Server
+	Router      router.Router
+	Reservation *reservation.Manager
+	Collector   *collector.PassiveCollector
+	Cleanup     func()
+}
+
+// setupTestServerExt creates a test server with SQLite database (extended version)
+func setupTestServerExt(t *testing.T) *TestServer {
+	gin.SetMode(gin.TestMode)
+
+	// Create temporary database
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test.db"
+
+	s, err := store.NewSQLiteStore(dbPath)
+	require.NoError(t, err, "Failed to create SQLite store")
+
+	// Setup components
+	cfg := config.ServerConfig{Host: "localhost", HTTPPort: 8080}
+	apiCfg := config.APIConfig{
+		Auth: config.AuthConfig{
+			Enabled: false,
+		},
+	}
+	rtr := router.NewRouter(s, router.DefaultConfig())
+	rm := reservation.NewManager(s, reservation.DefaultConfig())
+	pc := collector.NewPassiveCollector(s, 100, 100*time.Millisecond)
+
+	// Create server
+	srv := api.NewServer(cfg, apiCfg, s, rtr, rm, pc)
+
+	// Start passive collector
+	ctx := context.Background()
+	err = pc.Start(ctx)
+	require.NoError(t, err, "Failed to start passive collector")
+
+	cleanup := func() {
+		pc.Stop()
+		s.Close()
+	}
+
+	return &TestServer{
+		Engine:      srv.Router(),
+		Store:       s,
+		Server:      srv,
+		Router:      rtr,
+		Reservation: rm,
+		Collector:   pc,
+		Cleanup:     cleanup,
+	}
+}
+
+// setupTestServerWithAuth creates a test server with authentication enabled
+func setupTestServerWithAuth(t *testing.T, apiKeys []string) *TestServer {
+	gin.SetMode(gin.TestMode)
+
+	tmpDir := t.TempDir()
+	dbPath := tmpDir + "/test_auth.db"
+
+	s, err := store.NewSQLiteStore(dbPath)
+	require.NoError(t, err, "Failed to create SQLite store")
+
+	cfg := config.ServerConfig{Host: "localhost", HTTPPort: 8080}
+	apiCfg := config.APIConfig{
+		Auth: config.AuthConfig{
+			Enabled:    true,
+			APIKeys:    apiKeys,
+			HeaderName: "X-API-Key",
+		},
+	}
+	rtr := router.NewRouter(s, router.DefaultConfig())
+	rm := reservation.NewManager(s, reservation.DefaultConfig())
+	pc := collector.NewPassiveCollector(s, 100, 100*time.Millisecond)
+
+	srv := api.NewServer(cfg, apiCfg, s, rtr, rm, pc)
+
+	ctx := context.Background()
+	err = pc.Start(ctx)
+	require.NoError(t, err, "Failed to start passive collector")
+
+	cleanup := func() {
+		pc.Stop()
+		s.Close()
+	}
+
+	return &TestServer{
+		Engine:      srv.Router(),
+		Store:       s,
+		Server:      srv,
+		Router:      rtr,
+		Reservation: rm,
+		Collector:   pc,
+		Cleanup:     cleanup,
+	}
+}
+
+// createTestAccount creates a test account with the given ID and provider
+func createTestAccount(t *testing.T, s *store.SQLiteStore, id string, provider models.Provider, priority int) *models.Account {
+	acc := &models.Account{
+		ID:               id,
+		Provider:         provider,
+		Tier:             "tier-1",
+		Enabled:          true,
+		Priority:         priority,
+		ConcurrencyLimit: 100,
+		InputCost:        0.01,
+		OutputCost:       0.03,
+	}
+	s.SetAccount(acc)
+	return acc
+}
+
+// createTestQuota creates a test quota for the given account
+func createTestQuota(t *testing.T, s *store.SQLiteStore, accountID string, remainingPct float64, isThrottled bool) *models.QuotaInfo {
+	quota := &models.QuotaInfo{
+		AccountID:             accountID,
+		EffectiveRemainingPct: remainingPct,
+		IsThrottled:           isThrottled,
+		Confidence:            0.95,
+		Dimensions: models.DimensionSlice{
+			{Type: models.DimensionRPM, Limit: 3500, Used: int64(3500 * (100 - remainingPct) / 100), Remaining: int64(3500 * remainingPct / 100)},
+			{Type: models.DimensionTPM, Limit: 100000, Used: int64(100000 * (100 - remainingPct) / 100), Remaining: int64(100000 * remainingPct / 100)},
+		},
+	}
+	s.SetQuota(accountID, quota)
+	return quota
+}
+
+// requestRouterSelect makes a router select request and returns the response
+func requestRouterSelect(t *testing.T, engine *gin.Engine, provider string, policy string) *api.RouterSelectResponse {
+	body := api.RouterSelectRequest{
+		Provider: provider,
+		Policy:   policy,
+	}
+	jsonBody, err := json.Marshal(body)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/router/select", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp api.RouterSelectResponse
+	err = json.Unmarshal(w.Body.Bytes(), &resp)
+	require.NoError(t, err)
+
+	return &resp
+}
+
+// requestHealthCheck makes a health check request and returns the status
+func requestHealthCheck(t *testing.T, engine *gin.Engine) map[string]interface{} {
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/health", nil)
+	engine.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp map[string]interface{}
+	err := json.Unmarshal(w.Body.Bytes(), &resp)
+	require.NoError(t, err)
+
+	return resp
+}
+
+// createReservation makes a reservation request and returns the response
+func createReservation(t *testing.T, engine *gin.Engine, accountID string, costPct float64, correlationID string) *api.CreateReservationResponse {
+	body := api.CreateReservationRequest{
+		AccountID:        accountID,
+		EstimatedCostPct: costPct,
+		CorrelationID:    correlationID,
+	}
+	jsonBody, err := json.Marshal(body)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/reservations", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusCreated, w.Code)
+
+	var resp api.CreateReservationResponse
+	err = json.Unmarshal(w.Body.Bytes(), &resp)
+	require.NoError(t, err)
+
+	return &resp
+}
+
+// releaseReservation makes a release reservation request
+func releaseReservation(t *testing.T, engine *gin.Engine, reservationID string, actualCostPct float64) {
+	body := map[string]float64{"actual_cost_percent": actualCostPct}
+	jsonBody, err := json.Marshal(body)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/reservations/"+reservationID+"/release", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+// getQuota makes a get quota request and returns the quota info
+func getQuota(t *testing.T, engine *gin.Engine, accountID string) *models.QuotaInfo {
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/quotas/"+accountID, nil)
+	engine.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp models.QuotaInfo
+	err := json.Unmarshal(w.Body.Bytes(), &resp)
+	require.NoError(t, err)
+
+	return &resp
+}
+
+// listQuotas makes a list quotas request and returns the quotas map
+func listQuotas(t *testing.T, engine *gin.Engine) map[string]*models.QuotaInfo {
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/quotas", nil)
+	engine.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp map[string]*models.QuotaInfo
+	err := json.Unmarshal(w.Body.Bytes(), &resp)
+	require.NoError(t, err)
+
+	return resp
+}
+
+// routerSelectWithEstimate makes a router select request with estimated cost
+func routerSelectWithEstimate(t *testing.T, engine *gin.Engine, provider string, estimatedCost float64) *api.RouterSelectResponse {
+	body := api.RouterSelectRequest{
+		Provider:      provider,
+		EstimatedCost: estimatedCost,
+		Policy:        "balanced",
+	}
+	jsonBody, err := json.Marshal(body)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/router/select", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp api.RouterSelectResponse
+	err = json.Unmarshal(w.Body.Bytes(), &resp)
+	require.NoError(t, err)
+
+	return &resp
+}
+
+// getDistribution makes a get distribution request
+func getDistribution(t *testing.T, engine *gin.Engine) map[string]interface{} {
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/router/distribution", nil)
+	engine.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp map[string]interface{}
+	err := json.Unmarshal(w.Body.Bytes(), &resp)
+	require.NoError(t, err)
+
+	return resp
+}
+
+// ingestQuota makes an ingest request to update quota
+func ingestQuota(t *testing.T, engine *gin.Engine, accountID string, provider string, remainingPct float64) {
+	body := api.IngestRequest{
+		AccountID:             accountID,
+		Provider:              provider,
+		EffectiveRemainingPct: remainingPct,
+		Source:                "test",
+	}
+	jsonBody, err := json.Marshal(body)
+	require.NoError(t, err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/ingest", bytes.NewBuffer(jsonBody))
+	req.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+// makeAuthenticatedRequest makes a request with API key authentication
+func makeAuthenticatedRequest(t *testing.T, engine *gin.Engine, method string, path string, body interface{}, apiKey string) *http.Response {
+	var jsonBody []byte
+	var err error
+	if body != nil {
+		jsonBody, err = json.Marshal(body)
+		require.NoError(t, err)
+	}
+
+	w := httptest.NewRecorder()
+	var req *http.Request
+	if jsonBody != nil {
+		req, _ = http.NewRequest(method, path, bytes.NewBuffer(jsonBody))
+	} else {
+		req, _ = http.NewRequest(method, path, nil)
+	}
+
+	if apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	engine.ServeHTTP(w, req)
+
+	return w.Result()
+}
+
+// makeRequest makes a request without authentication
+func makeRequest(t *testing.T, engine *gin.Engine, method string, path string, body interface{}) *http.Response {
+	return makeAuthenticatedRequest(t, engine, method, path, body, "")
+}

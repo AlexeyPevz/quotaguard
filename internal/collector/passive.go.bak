@@ -1,0 +1,242 @@
+package collector
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"sync"
+	"time"
+
+	"github.com/quotaguard/quotaguard/internal/models"
+	"github.com/quotaguard/quotaguard/internal/store"
+)
+
+// PassiveCollector receives quota updates via HTTP endpoint and buffers them
+type PassiveCollector struct {
+	store      store.Store
+	buffer     chan *models.QuotaInfo
+	bufferSize int
+	flushInt   time.Duration
+	mu         sync.RWMutex
+	running    bool
+	stopCh     chan struct{}
+	wg         sync.WaitGroup
+}
+
+// NewPassiveCollector creates a new passive collector
+func NewPassiveCollector(s store.Store, bufferSize int, flushInterval time.Duration) *PassiveCollector {
+	return &PassiveCollector{
+		store:      s,
+		buffer:     make(chan *models.QuotaInfo, bufferSize),
+		bufferSize: bufferSize,
+		flushInt:   flushInterval,
+	}
+}
+
+// Start begins the collector's background flush routine
+func (c *PassiveCollector) Start(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.running {
+		return fmt.Errorf("collector already running")
+	}
+
+	c.running = true
+	c.stopCh = make(chan struct{})
+	c.wg.Add(1)
+	go c.flushLoop(ctx)
+
+	return nil
+}
+
+// Stop gracefully shuts down the collector
+func (c *PassiveCollector) Stop() error {
+	c.mu.Lock()
+	if !c.running {
+		c.mu.Unlock()
+		return nil
+	}
+	c.running = false
+	stopCh := c.stopCh
+	c.mu.Unlock()
+
+	close(stopCh)
+
+	// Wait for flush loop to finish
+	c.wg.Wait()
+
+	// Flush remaining items
+	c.flush()
+
+	return nil
+}
+
+// Ingest adds a quota update to the buffer
+func (c *PassiveCollector) Ingest(quota *models.QuotaInfo) error {
+	select {
+	case c.buffer <- quota:
+		return nil
+	default:
+		return fmt.Errorf("buffer full")
+	}
+}
+
+// flushLoop periodically flushes the buffer to the store
+func (c *PassiveCollector) flushLoop(ctx context.Context) {
+	defer c.wg.Done()
+
+	ticker := time.NewTicker(c.flushInt)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.stopCh:
+			return
+		case <-ticker.C:
+			c.flush()
+		}
+	}
+}
+
+// flush writes all buffered quota updates to the store
+func (c *PassiveCollector) flush() {
+	for {
+		select {
+		case quota := <-c.buffer:
+			c.store.SetQuota(quota.AccountID, quota)
+		default:
+			return
+		}
+	}
+}
+
+// BufferSize returns the current buffer size
+func (c *PassiveCollector) BufferSize() int {
+	return len(c.buffer)
+}
+
+// IsRunning returns true if the collector is running
+func (c *PassiveCollector) IsRunning() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.running
+}
+
+// IngestRequest represents a request to ingest quota data
+type IngestRequest struct {
+	AccountID string              `json:"account_id"`
+	Provider  models.Provider     `json:"provider"`
+	Headers   map[string][]string `json:"headers"`
+}
+
+// IngestResponse represents the response from an ingest request
+type IngestResponse struct {
+	Success bool   `json:"success"`
+	Error   string `json:"error,omitempty"`
+}
+
+// HTTPHandler handles HTTP requests for quota ingestion
+func (c *PassiveCollector) HTTPHandler(parserRegistry ParserRegistry) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req IngestRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			respondWithError(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		if req.AccountID == "" {
+			respondWithError(w, "account_id is required", http.StatusBadRequest)
+			return
+		}
+
+		// Convert headers map to http.Header
+		headers := make(http.Header)
+		for k, v := range req.Headers {
+			headers[k] = v
+		}
+
+		// Parse headers using appropriate parser
+		quota, err := parserRegistry.Parse(req.Provider, headers, req.AccountID)
+		if err != nil {
+			respondWithError(w, fmt.Sprintf("Failed to parse headers: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		// Add to buffer
+		if err := c.Ingest(quota); err != nil {
+			respondWithError(w, fmt.Sprintf("Failed to ingest: %v", err), http.StatusServiceUnavailable)
+			return
+		}
+
+		resp := IngestResponse{Success: true}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(resp)
+	}
+}
+
+// HTTPHandlerWithAutoDetect handles HTTP requests with auto-detection of provider
+func (c *PassiveCollector) HTTPHandlerWithAutoDetect(parserRegistry ParserRegistry) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req IngestRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			respondWithError(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		if req.AccountID == "" {
+			respondWithError(w, "account_id is required", http.StatusBadRequest)
+			return
+		}
+
+		// Convert headers map to http.Header
+		headers := make(http.Header)
+		for k, v := range req.Headers {
+			headers[k] = v
+		}
+
+		// Auto-detect provider and parse
+		quota, _, err := parserRegistry.AutoDetect(headers, req.AccountID)
+		if err != nil {
+			respondWithError(w, fmt.Sprintf("Failed to auto-detect and parse: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		// Add to buffer
+		if err := c.Ingest(quota); err != nil {
+			respondWithError(w, fmt.Sprintf("Failed to ingest: %v", err), http.StatusServiceUnavailable)
+			return
+		}
+
+		resp := IngestResponse{Success: true}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(resp)
+	}
+}
+
+// ParserRegistry defines the interface for parsing headers
+type ParserRegistry interface {
+	Parse(provider models.Provider, headers http.Header, accountID string) (*models.QuotaInfo, error)
+	AutoDetect(headers http.Header, accountID string) (*models.QuotaInfo, models.Provider, error)
+}
+
+func respondWithError(w http.ResponseWriter, message string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(IngestResponse{Success: false, Error: message})
+}

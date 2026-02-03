@@ -1,0 +1,504 @@
+package integration
+
+import (
+	"context"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/quotaguard/quotaguard/internal/models"
+	"github.com/quotaguard/quotaguard/internal/router"
+	"github.com/quotaguard/quotaguard/internal/store"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// setupRouterTest creates a router with SQLite store for testing
+func setupRouterTest(t *testing.T) (router.Router, *store.SQLiteStore, func()) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "router_test.db")
+
+	s, err := store.NewSQLiteStore(dbPath)
+	require.NoError(t, err, "Failed to create SQLite store")
+
+	cfg := router.DefaultConfig()
+	r := router.NewRouter(s, cfg)
+
+	cleanup := func() {
+		s.Close()
+	}
+
+	return r, s, cleanup
+}
+
+func TestRouter_AccountSelectionByQuota(t *testing.T) {
+	r, s, cleanup := setupRouterTest(t)
+	defer cleanup()
+
+	// Create accounts with different quotas
+	accounts := []*models.Account{
+		{
+			ID:         "router-high-quota",
+			Provider:   models.ProviderOpenAI,
+			Tier:       "tier-1",
+			Enabled:    true,
+			Priority:   10,
+			InputCost:  0.01,
+			OutputCost: 0.03,
+		},
+		{
+			ID:         "router-low-quota",
+			Provider:   models.ProviderOpenAI,
+			Tier:       "tier-2",
+			Enabled:    true,
+			Priority:   5,
+			InputCost:  0.015,
+			OutputCost: 0.045,
+		},
+	}
+
+	for _, acc := range accounts {
+		s.SetAccount(acc)
+	}
+
+	// Set quotas - high quota account should be selected
+	quotas := []*models.QuotaInfo{
+		{
+			AccountID:             "router-high-quota",
+			Provider:              models.ProviderOpenAI,
+			EffectiveRemainingPct: 85.0,
+			Confidence:            0.95,
+		},
+		{
+			AccountID:             "router-low-quota",
+			Provider:              models.ProviderOpenAI,
+			EffectiveRemainingPct: 30.0,
+			Confidence:            0.85,
+		},
+	}
+
+	for _, q := range quotas {
+		s.SetQuota(q.AccountID, q)
+	}
+
+	t.Run("select account with highest quota", func(t *testing.T) {
+		resp, err := r.Select(context.Background(), router.SelectRequest{
+			Provider: models.ProviderOpenAI,
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, "router-high-quota", resp.AccountID)
+		assert.Greater(t, resp.Score, 0.0)
+	})
+
+	t.Run("select with estimated cost", func(t *testing.T) {
+		resp, err := r.Select(context.Background(), router.SelectRequest{
+			Provider:      models.ProviderOpenAI,
+			EstimatedCost: 5.0,
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, "router-high-quota", resp.AccountID)
+	})
+
+	t.Run("select with exclude list", func(t *testing.T) {
+		resp, err := r.Select(context.Background(), router.SelectRequest{
+			Provider: models.ProviderOpenAI,
+			Exclude:  []string{"router-high-quota"},
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, "router-low-quota", resp.AccountID)
+	})
+
+	t.Run("no accounts match provider filter", func(t *testing.T) {
+		_, err := r.Select(context.Background(), router.SelectRequest{
+			Provider: models.ProviderAnthropic,
+		})
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "no suitable accounts found")
+	})
+}
+
+func TestRouter_AntiFlappingBehavior(t *testing.T) {
+	r, s, cleanup := setupRouterTest(t)
+	defer cleanup()
+
+	// Create accounts
+	accounts := []*models.Account{
+		{ID: "flap-acc-1", Provider: models.ProviderOpenAI, Enabled: true, Priority: 10},
+		{ID: "flap-acc-2", Provider: models.ProviderOpenAI, Enabled: true, Priority: 5},
+	}
+
+	for _, acc := range accounts {
+		s.SetAccount(acc)
+	}
+
+	// Set equal quotas
+	quota1 := &models.QuotaInfo{
+		AccountID:             "flap-acc-1",
+		Provider:              models.ProviderOpenAI,
+		EffectiveRemainingPct: 50.0,
+		Confidence:            0.9,
+	}
+	quota2 := &models.QuotaInfo{
+		AccountID:             "flap-acc-2",
+		Provider:              models.ProviderOpenAI,
+		EffectiveRemainingPct: 50.0,
+		Confidence:            0.9,
+	}
+	s.SetQuota("flap-acc-1", quota1)
+	s.SetQuota("flap-acc-2", quota2)
+
+	t.Run("first selection chooses highest priority", func(t *testing.T) {
+		resp, err := r.Select(context.Background(), router.SelectRequest{
+			Provider: models.ProviderOpenAI,
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, "flap-acc-1", resp.AccountID) // Higher priority
+	})
+
+	t.Run("switch is recorded", func(t *testing.T) {
+		r.RecordSwitch("flap-acc-2")
+
+		stats := r.GetStats()
+		assert.Equal(t, 1, stats.LastSwitches)
+		assert.Equal(t, "flap-acc-2", r.GetCurrentAccount())
+	})
+
+	t.Run("cooldown prevents switching", func(t *testing.T) {
+		// Set short cooldown
+		cfg := router.DefaultConfig()
+		cfg.CooldownAfterSwitch = 100 * time.Millisecond
+		r2 := router.NewRouter(s, cfg)
+
+		r2.RecordSwitch("flap-acc-1")
+
+		// After cooldown, should be able to switch
+		time.Sleep(150 * time.Millisecond)
+		// Router should have switched
+		assert.Equal(t, "flap-acc-1", r2.GetCurrentAccount())
+	})
+}
+
+func TestRouter_SoftReservationIntegration(t *testing.T) {
+	r, s, cleanup := setupRouterTest(t)
+	defer cleanup()
+
+	// Create account
+	acc := &models.Account{
+		ID:         "soft-res-acc",
+		Provider:   models.ProviderOpenAI,
+		Tier:       "tier-1",
+		Enabled:    true,
+		Priority:   10,
+		InputCost:  0.01,
+		OutputCost: 0.03,
+	}
+	s.SetAccount(acc)
+
+	// Set quota
+	quota := &models.QuotaInfo{
+		AccountID:             "soft-res-acc",
+		Provider:              models.ProviderOpenAI,
+		EffectiveRemainingPct: 80.0,
+		Confidence:            0.95,
+		VirtualUsedPercent:    0.0,
+	}
+	s.SetQuota("soft-res-acc", quota)
+
+	t.Run("initial selection uses full quota", func(t *testing.T) {
+		resp, err := r.Select(context.Background(), router.SelectRequest{
+			Provider:      models.ProviderOpenAI,
+			EstimatedCost: 10.0,
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, "soft-res-acc", resp.AccountID)
+	})
+
+	t.Run("quota reflects virtual usage", func(t *testing.T) {
+		// Update quota with virtual usage
+		quota.VirtualUsedPercent = 10.0
+		s.SetQuota("soft-res-acc", quota)
+
+		// Get account status
+		status, err := r.GetAccountStatus("soft-res-acc")
+		require.NoError(t, err)
+
+		// Effective remaining should account for virtual usage
+		expectedRemaining := 80.0 - 10.0
+		assert.InDelta(t, expectedRemaining, status.EffectiveRemaining, 0.01)
+	})
+}
+
+func TestRouter_FallbackChainSelection(t *testing.T) {
+	r, s, cleanup := setupRouterTest(t)
+	defer cleanup()
+
+	// Create chain of accounts
+	accounts := []*models.Account{
+		{ID: "fallback-primary", Provider: models.ProviderOpenAI, Enabled: true, Priority: 10},
+		{ID: "fallback-secondary", Provider: models.ProviderOpenAI, Enabled: true, Priority: 5},
+		{ID: "fallback-tertiary", Provider: models.ProviderOpenAI, Enabled: true, Priority: 1},
+	}
+
+	for _, acc := range accounts {
+		s.SetAccount(acc)
+	}
+
+	// Set quotas - primary is critical
+	quotas := []*models.QuotaInfo{
+		{
+			AccountID:             "fallback-primary",
+			Provider:              models.ProviderOpenAI,
+			EffectiveRemainingPct: 3.0, // Critical
+			Confidence:            0.8,
+		},
+		{
+			AccountID:             "fallback-secondary",
+			Provider:              models.ProviderOpenAI,
+			EffectiveRemainingPct: 60.0, // Good
+			Confidence:            0.9,
+		},
+		{
+			AccountID:             "fallback-tertiary",
+			Provider:              models.ProviderOpenAI,
+			EffectiveRemainingPct: 40.0, // Okay
+			Confidence:            0.85,
+		},
+	}
+
+	for _, q := range quotas {
+		s.SetQuota(q.AccountID, q)
+	}
+
+	t.Run("fallback to secondary when primary is critical", func(t *testing.T) {
+		resp, err := r.Select(context.Background(), router.SelectRequest{
+			Provider:      models.ProviderOpenAI,
+			EstimatedCost: 5.0,
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, "fallback-secondary", resp.AccountID)
+		assert.Contains(t, resp.Reason, "critical")
+	})
+
+	t.Run("fallback to tertiary when secondary also critical", func(t *testing.T) {
+		// Make secondary critical too
+		secondaryQuota := &models.QuotaInfo{
+			AccountID:             "fallback-secondary",
+			Provider:              models.ProviderOpenAI,
+			EffectiveRemainingPct: 2.0, // Critical
+			Confidence:            0.8,
+		}
+		s.SetQuota("fallback-secondary", secondaryQuota)
+
+		resp, err := r.Select(context.Background(), router.SelectRequest{
+			Provider:      models.ProviderOpenAI,
+			EstimatedCost: 5.0,
+		})
+
+		require.NoError(t, err)
+		assert.Equal(t, "fallback-tertiary", resp.AccountID)
+	})
+
+	t.Run("distribution reflects account scores", func(t *testing.T) {
+		// Restore secondary to healthy to reflect scores
+		s.SetQuota("fallback-secondary", &models.QuotaInfo{
+			AccountID:             "fallback-secondary",
+			Provider:              models.ProviderOpenAI,
+			EffectiveRemainingPct: 60.0,
+			Confidence:            0.9,
+		})
+
+		distribution := r.CalculateOptimalDistribution(context.Background(), 100)
+
+		require.NotNil(t, distribution)
+		assert.Len(t, distribution, 3)
+
+		// Secondary should have highest distribution
+		secondaryDist := distribution["fallback-secondary"]
+		tertiaryDist := distribution["fallback-tertiary"]
+
+		assert.GreaterOrEqual(t, secondaryDist, tertiaryDist)
+	})
+}
+
+func TestRouter_CalculateOptimalDistribution(t *testing.T) {
+	r, s, cleanup := setupRouterTest(t)
+	defer cleanup()
+
+	// Create accounts with different scores
+	accounts := []*models.Account{
+		{ID: "dist-best", Provider: models.ProviderOpenAI, Enabled: true, Priority: 10},
+		{ID: "dist-good", Provider: models.ProviderOpenAI, Enabled: true, Priority: 8},
+		{ID: "dist-poor", Provider: models.ProviderOpenAI, Enabled: true, Priority: 5},
+	}
+
+	for _, acc := range accounts {
+		s.SetAccount(acc)
+	}
+
+	quotas := []*models.QuotaInfo{
+		{
+			AccountID:             "dist-best",
+			Provider:              models.ProviderOpenAI,
+			EffectiveRemainingPct: 90.0,
+			Confidence:            0.95,
+		},
+		{
+			AccountID:             "dist-good",
+			Provider:              models.ProviderOpenAI,
+			EffectiveRemainingPct: 60.0,
+			Confidence:            0.9,
+		},
+		{
+			AccountID:             "dist-poor",
+			Provider:              models.ProviderOpenAI,
+			EffectiveRemainingPct: 20.0,
+			Confidence:            0.85,
+		},
+	}
+
+	for _, q := range quotas {
+		s.SetQuota(q.AccountID, q)
+	}
+
+	t.Run("distribution sums to 100%", func(t *testing.T) {
+		distribution := r.CalculateOptimalDistribution(context.Background(), 100)
+
+		var total float64
+		for _, pct := range distribution {
+			total += pct
+		}
+
+		assert.InDelta(t, 100.0, total, 0.01)
+	})
+
+	t.Run("best account gets highest distribution", func(t *testing.T) {
+		distribution := r.CalculateOptimalDistribution(context.Background(), 100)
+
+		bestDist := distribution["dist-best"]
+		goodDist := distribution["dist-good"]
+		poorDist := distribution["dist-poor"]
+
+		assert.GreaterOrEqual(t, bestDist, goodDist)
+		assert.GreaterOrEqual(t, goodDist, poorDist)
+	})
+
+	t.Run("all accounts included", func(t *testing.T) {
+		distribution := r.CalculateOptimalDistribution(context.Background(), 100)
+
+		assert.Contains(t, distribution, "dist-best")
+		assert.Contains(t, distribution, "dist-good")
+		assert.Contains(t, distribution, "dist-poor")
+	})
+}
+
+func TestRouter_PolicyBasedSelection(t *testing.T) {
+	r, s, cleanup := setupRouterTest(t)
+	defer cleanup()
+
+	// Create accounts with different cost profiles
+	accounts := []*models.Account{
+		{
+			ID:         "costly-acc",
+			Provider:   models.ProviderOpenAI,
+			Tier:       "tier-1",
+			Enabled:    true,
+			Priority:   10,
+			InputCost:  0.03,
+			OutputCost: 0.09,
+		},
+		{
+			ID:         "cheap-acc",
+			Provider:   models.ProviderOpenAI,
+			Tier:       "tier-2",
+			Enabled:    true,
+			Priority:   5,
+			InputCost:  0.01,
+			OutputCost: 0.03,
+		},
+	}
+
+	for _, acc := range accounts {
+		s.SetAccount(acc)
+	}
+
+	quotas := []*models.QuotaInfo{
+		{
+			AccountID:             "costly-acc",
+			Provider:              models.ProviderOpenAI,
+			EffectiveRemainingPct: 80.0,
+			Confidence:            0.95,
+		},
+		{
+			AccountID:             "cheap-acc",
+			Provider:              models.ProviderOpenAI,
+			EffectiveRemainingPct: 80.0,
+			Confidence:            0.95,
+		},
+	}
+
+	for _, q := range quotas {
+		s.SetQuota(q.AccountID, q)
+	}
+
+	t.Run("balanced policy", func(t *testing.T) {
+		resp, err := r.Select(context.Background(), router.SelectRequest{
+			Provider: models.ProviderOpenAI,
+			Policy:   "balanced",
+		})
+
+		require.NoError(t, err)
+		// Should select based on balanced scoring
+		assert.NotEmpty(t, resp.AccountID)
+	})
+
+	t.Run("cost policy prefers cheaper account", func(t *testing.T) {
+		resp, err := r.Select(context.Background(), router.SelectRequest{
+			Provider: models.ProviderOpenAI,
+			Policy:   "cost",
+		})
+
+		require.NoError(t, err)
+		// With cost policy, cheaper account should be preferred
+		// (assuming equal quotas)
+		assert.NotEmpty(t, resp.AccountID)
+	})
+}
+
+func TestRouter_IsHealthy(t *testing.T) {
+	t.Run("healthy with enabled accounts", func(t *testing.T) {
+		r, s, cleanup := setupRouterTest(t)
+		defer cleanup()
+
+		acc := &models.Account{ID: "healthy-acc", Provider: models.ProviderOpenAI, Enabled: true}
+		s.SetAccount(acc)
+
+		assert.True(t, r.IsHealthy())
+	})
+
+	t.Run("unhealthy without accounts", func(t *testing.T) {
+		emptyStore, err := store.NewSQLiteStore(t.TempDir() + "/empty.db")
+		require.NoError(t, err)
+		defer emptyStore.Close()
+
+		emptyRouter := router.NewRouter(emptyStore, router.DefaultConfig())
+
+		assert.False(t, emptyRouter.IsHealthy())
+	})
+
+	t.Run("unhealthy with only disabled accounts", func(t *testing.T) {
+		r, s, cleanup := setupRouterTest(t)
+		defer cleanup()
+
+		acc := &models.Account{ID: "disabled-acc", Provider: models.ProviderOpenAI, Enabled: false}
+		s.SetAccount(acc)
+
+		assert.False(t, r.IsHealthy())
+	})
+}

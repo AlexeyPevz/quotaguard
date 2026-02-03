@@ -1,0 +1,251 @@
+package cli
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/quotaguard/quotaguard/internal/api"
+	"github.com/quotaguard/quotaguard/internal/collector"
+	"github.com/quotaguard/quotaguard/internal/config"
+	"github.com/quotaguard/quotaguard/internal/reservation"
+	"github.com/quotaguard/quotaguard/internal/router"
+	"github.com/quotaguard/quotaguard/internal/store"
+	"github.com/spf13/cobra"
+)
+
+// serveCmd represents the serve command
+var serveCmd = &cobra.Command{
+	Use:     "serve",
+	Aliases: []string{"s", "server", "run"},
+	Short:   "Start the QuotaGuard server",
+	Long: `Start the QuotaGuard server in main mode.
+
+This command starts the HTTP server that handles quota management,
+routing requests, and health monitoring.
+
+Example:
+  quotaguard serve --config config.yaml --db ./data/quotaguard.db
+
+The server will start listening on the address configured in the config file.`,
+	RunE: runServe,
+}
+
+var serveFlags struct {
+	Host       string
+	Port       int
+	Timeout    time.Duration
+	TLS        bool
+	TLSCert    string
+	TLSKey     string
+	TLSVersion string
+}
+
+func init() {
+	serveCmd.Flags().StringVar(&serveFlags.Host, "host", "", "Server host (overrides config)")
+	serveCmd.Flags().IntVar(&serveFlags.Port, "port", 0, "Server port (overrides config)")
+	serveCmd.Flags().DurationVar(&serveFlags.Timeout, "timeout", 30*time.Second, "Shutdown timeout")
+	serveCmd.Flags().BoolVar(&serveFlags.TLS, "tls", false, "Enable TLS/HTTPS")
+	serveCmd.Flags().StringVar(&serveFlags.TLSCert, "cert", "", "TLS certificate file path")
+	serveCmd.Flags().StringVar(&serveFlags.TLSKey, "key", "", "TLS key file path")
+	serveCmd.Flags().StringVar(&serveFlags.TLSVersion, "tls-version", "1.3", "Minimum TLS version (1.2 or 1.3)")
+
+	RootCmd.AddCommand(serveCmd)
+}
+
+func runServe(cmd *cobra.Command, args []string) error {
+	if globalFlags.Verbose {
+		log.Println("Starting QuotaGuard server...")
+		log.Printf("Config path: %s", globalFlags.Config)
+		log.Printf("Database path: %s", globalFlags.DBPath)
+	}
+
+	// Load configuration
+	loader := config.NewLoader(globalFlags.Config)
+	cfg, err := loader.Load()
+	if err != nil {
+		return fmt.Errorf("failed to load configuration: %w", err)
+	}
+
+	// Apply CLI flags to config
+	if serveFlags.TLS {
+		cfg.Server.TLS.Enabled = true
+	}
+	if serveFlags.TLSCert != "" {
+		cfg.Server.TLS.CertFile = serveFlags.TLSCert
+	}
+	if serveFlags.TLSKey != "" {
+		cfg.Server.TLS.KeyFile = serveFlags.TLSKey
+	}
+	if serveFlags.TLSVersion != "" {
+		cfg.Server.TLS.MinVersion = serveFlags.TLSVersion
+	}
+
+	if globalFlags.Verbose {
+		log.Printf("Configuration loaded successfully")
+		log.Printf("Server host: %s, port: %d", cfg.Server.Host, cfg.Server.HTTPPort)
+		if cfg.Server.TLS.Enabled {
+			log.Printf("TLS enabled: true, cert: %s, min_version: %s", cfg.Server.TLS.CertFile, cfg.Server.TLS.MinVersion)
+		}
+	}
+
+	// Validate TLS configuration if enabled
+	if cfg.Server.TLS.Enabled {
+		if err := validateTLSConfig(cfg.Server.TLS); err != nil {
+			return fmt.Errorf("TLS validation failed: %w", err)
+		}
+		if globalFlags.Verbose {
+			log.Println("TLS configuration validated successfully")
+		}
+	}
+
+	// Create SQLite store with WAL mode enabled
+	sqliteStore, err := store.NewSQLiteStore(globalFlags.DBPath)
+	if err != nil {
+		return fmt.Errorf("failed to create SQLite store: %w", err)
+	}
+
+	if globalFlags.Verbose {
+		log.Printf("Database initialized at: %s", globalFlags.DBPath)
+	}
+
+	defer func() {
+		if globalFlags.Verbose {
+			log.Println("Shutting down gracefully...")
+		}
+		if err := sqliteStore.Close(); err != nil {
+			log.Printf("Error closing store: %v", err)
+		}
+		if globalFlags.Verbose {
+			log.Println("Store closed successfully")
+		}
+	}()
+
+	// Create router service with converted config
+	routerConfig := router.Config{
+		WarningThreshold:    cfg.Router.Thresholds.Warning,
+		SwitchThreshold:     cfg.Router.Thresholds.Switch,
+		CriticalThreshold:   cfg.Router.Thresholds.Critical,
+		MinSafeThreshold:    cfg.Router.Thresholds.MinSafe,
+		MinDwellTime:        cfg.Router.AntiFlapping.MinDwellTime,
+		CooldownAfterSwitch: cfg.Router.AntiFlapping.CooldownAfterSwitch,
+		HysteresisMargin:    cfg.Router.AntiFlapping.HysteresisMargin,
+		Weights: router.Weights{
+			Safety:      cfg.Router.Weights.Safety,
+			Refill:      cfg.Router.Weights.Refill,
+			Tier:        cfg.Router.Weights.Tier,
+			Reliability: cfg.Router.Weights.Reliability,
+			Cost:        cfg.Router.Weights.Cost,
+		},
+		DefaultPolicy:  "balanced",
+		Policies:       make(map[string]router.Weights),
+		FallbackChains: cfg.Router.FallbackChains,
+	}
+	routerSvc := router.NewRouter(sqliteStore, routerConfig)
+
+	// Create reservation manager
+	reservationConfig := reservation.Config{
+		DefaultTTL: cfg.Router.Reservation.Timeout,
+	}
+	reservationMgr := reservation.NewManager(sqliteStore, reservationConfig)
+
+	// Create passive collector
+	passiveCollector := collector.NewPassiveCollector(
+		sqliteStore,
+		cfg.Collector.Passive.BufferSize,
+		cfg.Collector.Passive.FlushInterval,
+	)
+
+	// Create API server
+	server := api.NewServer(cfg.Server, cfg.API, sqliteStore, routerSvc, reservationMgr, passiveCollector)
+
+	// Setup graceful shutdown with all components
+	setupGracefulShutdown(server, routerSvc, reservationMgr, passiveCollector, sqliteStore, serveFlags.Timeout)
+
+	// Determine address
+	host := serveFlags.Host
+	if host == "" {
+		host = cfg.Server.Host
+	}
+	port := serveFlags.Port
+	if port == 0 {
+		port = cfg.Server.HTTPPort
+	}
+	addr := fmt.Sprintf("%s:%d", host, port)
+
+	if cfg.Server.TLS.Enabled {
+		log.Printf("Starting QuotaGuard HTTPS server on %s", addr)
+		log.Printf("TLS cert: %s, key: %s, min_version: %s", cfg.Server.TLS.CertFile, cfg.Server.TLS.KeyFile, cfg.Server.TLS.MinVersion)
+	} else {
+		log.Printf("Starting QuotaGuard HTTP server on %s", addr)
+	}
+	log.Printf("Database: %s (WAL mode enabled)", globalFlags.DBPath)
+
+	if err := server.Run(); err != nil && err != http.ErrServerClosed {
+		return fmt.Errorf("server error: %w", err)
+	}
+
+	return nil
+}
+
+// validateTLSConfig validates TLS configuration
+func validateTLSConfig(tls config.TLSConfig) error {
+	if tls.CertFile == "" {
+		return fmt.Errorf("TLS certificate file is required when TLS is enabled")
+	}
+	if tls.KeyFile == "" {
+		return fmt.Errorf("TLS key file is required when TLS is enabled")
+	}
+
+	// Check if certificate file exists
+	if _, err := os.Stat(tls.CertFile); os.IsNotExist(err) {
+		return fmt.Errorf("TLS certificate file does not exist: %s", tls.CertFile)
+	}
+
+	// Check if key file exists
+	if _, err := os.Stat(tls.KeyFile); os.IsNotExist(err) {
+		return fmt.Errorf("TLS key file does not exist: %s", tls.KeyFile)
+	}
+
+	// Validate TLS version
+	if tls.MinVersion != "" && tls.MinVersion != "1.2" && tls.MinVersion != "1.3" {
+		return fmt.Errorf("TLS min_version must be either \"1.2\" or \"1.3\", got: %s", tls.MinVersion)
+	}
+
+	return nil
+}
+
+// setupGracefulShutdown handles graceful shutdown of all components
+func setupGracefulShutdown(server *api.Server, router router.Router, reservation *reservation.Manager, coll *collector.PassiveCollector, s *store.SQLiteStore, timeout time.Duration) {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigChan
+		log.Printf("Received signal: %v", sig)
+
+		// Create context with timeout for shutdown
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		// Shutdown server (which stops router, collector)
+		log.Println("Shutting down API server...")
+		if err := server.Shutdown(ctx); err != nil {
+			log.Printf("Error during server shutdown: %v", err)
+		}
+
+		// Close store
+		log.Println("Closing database store...")
+		if err := s.Close(); err != nil {
+			log.Printf("Error closing store: %v", err)
+		}
+
+		log.Println("Graceful shutdown completed")
+		os.Exit(0)
+	}()
+}

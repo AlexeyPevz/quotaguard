@@ -1,0 +1,302 @@
+package integration
+
+import (
+	"testing"
+
+	"github.com/quotaguard/quotaguard/internal/models"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestRouter_WithMultipleAccounts tests router behavior with multiple accounts
+func TestRouter_WithMultipleAccounts(t *testing.T) {
+	ts := setupTestServerExt(t)
+	defer ts.Cleanup()
+
+	// Create multiple accounts for the same provider with different priorities
+	accounts := []struct {
+		id       string
+		priority int
+		quota    float64
+	}{
+		{"multi-1", 10, 50.0},
+		{"multi-2", 8, 70.0},
+		{"multi-3", 6, 90.0},
+		{"multi-4", 4, 30.0},
+	}
+
+	for _, acc := range accounts {
+		createTestAccount(t, ts.Store, acc.id, models.ProviderOpenAI, acc.priority)
+		createTestQuota(t, ts.Store, acc.id, acc.quota, false)
+	}
+
+	t.Run("selects highest priority when quotas are similar", func(t *testing.T) {
+		// Update quotas to be similar
+		for _, acc := range accounts {
+			quota := createTestQuota(t, ts.Store, acc.id, 70.0, false)
+			_ = quota
+		}
+
+		resp := requestRouterSelect(t, ts.Engine, "openai", "balanced")
+		assert.Equal(t, "multi-1", resp.AccountID) // Highest priority
+	})
+
+	t.Run("selects highest quota when priorities are similar", func(t *testing.T) {
+		// Reset priorities to be the same
+		for _, acc := range accounts {
+			ts.Store.DeleteAccount(acc.id)
+			createTestAccount(t, ts.Store, acc.id, models.ProviderOpenAI, 5)
+		}
+
+		resp := requestRouterSelect(t, ts.Engine, "openai", "balanced")
+		assert.Equal(t, "multi-3", resp.AccountID) // Highest quota (90%)
+	})
+
+	t.Run("filters by provider correctly", func(t *testing.T) {
+		// Add Anthropic account
+		createTestAccount(t, ts.Store, "anthropic-multi", models.ProviderAnthropic, 10)
+		createTestQuota(t, ts.Store, "anthropic-multi", 80.0, false)
+
+		// OpenAI request should not return Anthropic account
+		resp := requestRouterSelect(t, ts.Engine, "openai", "balanced")
+		assert.Equal(t, "openai", resp.Provider)
+		assert.NotEqual(t, "anthropic-multi", resp.AccountID)
+
+		// Anthropic request should return Anthropic account
+		resp = requestRouterSelect(t, ts.Engine, "anthropic", "balanced")
+		assert.Equal(t, "anthropic", resp.Provider)
+		assert.Equal(t, "anthropic-multi", resp.AccountID)
+	})
+}
+
+// TestRouter_Failover tests router failover scenarios
+func TestRouter_Failover(t *testing.T) {
+	ts := setupTestServerExt(t)
+	defer ts.Cleanup()
+
+	// Create primary and secondary accounts
+	createTestAccount(t, ts.Store, "failover-primary", models.ProviderOpenAI, 10)
+	createTestAccount(t, ts.Store, "failover-secondary", models.ProviderOpenAI, 5)
+
+	// Primary has critical quota
+	quotaPrimary := createTestQuota(t, ts.Store, "failover-primary", 3.0, false)
+	quotaPrimary.IsThrottled = true
+	ts.Store.SetQuota("failover-primary", quotaPrimary)
+
+	// Secondary has healthy quota
+	createTestQuota(t, ts.Store, "failover-secondary", 70.0, false)
+
+	t.Run("fails over to secondary when primary is critical", func(t *testing.T) {
+		resp := requestRouterSelect(t, ts.Engine, "openai", "balanced")
+		assert.Equal(t, "failover-secondary", resp.AccountID)
+	})
+
+	t.Run("returns to primary when it recovers", func(t *testing.T) {
+		// First, failover to secondary
+		resp := requestRouterSelect(t, ts.Engine, "openai", "balanced")
+		assert.Equal(t, "failover-secondary", resp.AccountID)
+
+		// Update primary quota to be healthy
+		quotaPrimary := createTestQuota(t, ts.Store, "failover-primary", 85.0, false)
+		quotaPrimary.IsThrottled = false
+		ts.Store.SetQuota("failover-primary", quotaPrimary)
+
+		// Router should select primary again (after dwell time)
+		resp = requestRouterSelect(t, ts.Engine, "openai", "balanced")
+		assert.Equal(t, "failover-primary", resp.AccountID)
+	})
+}
+
+// TestRouter_CircuitBreaker tests circuit breaker functionality
+func TestRouter_CircuitBreaker(t *testing.T) {
+	ts := setupTestServerExt(t)
+	defer ts.Cleanup()
+
+	// Create accounts
+	createTestAccount(t, ts.Store, "cb-account-1", models.ProviderOpenAI, 10)
+	createTestAccount(t, ts.Store, "cb-account-2", models.ProviderAnthropic, 8)
+
+	// Create quotas
+	createTestQuota(t, ts.Store, "cb-account-1", 70.0, false)
+	createTestQuota(t, ts.Store, "cb-account-2", 80.0, false)
+
+	t.Run("routes to healthy providers", func(t *testing.T) {
+		resp := requestRouterSelect(t, ts.Engine, "openai", "balanced")
+		assert.Equal(t, "openai", resp.Provider)
+		assert.Equal(t, "cb-account-1", resp.AccountID)
+
+		resp = requestRouterSelect(t, ts.Engine, "anthropic", "balanced")
+		assert.Equal(t, "anthropic", resp.Provider)
+		assert.Equal(t, "cb-account-2", resp.AccountID)
+	})
+
+	t.Run("handles provider exclusion", func(t *testing.T) {
+		// Make request excluding openai provider
+		body := map[string]interface{}{
+			"provider":          "openai",
+			"exclude_providers": []string{"openai"},
+		}
+		w := makeRequest(t, ts.Engine, "POST", "/router/select", body)
+		// Should fail because openai is excluded and it's the only provider
+		assert.Equal(t, 503, w.StatusCode)
+	})
+}
+
+// TestRouter_PolicySelection tests different routing policies
+func TestRouter_PolicySelection(t *testing.T) {
+	ts := setupTestServerExt(t)
+	defer ts.Cleanup()
+
+	// Create accounts with different characteristics
+	accounts := []struct {
+		id         string
+		priority   int
+		quota      float64
+		inputCost  float64
+		outputCost float64
+	}{
+		{"policy-high-prio", 10, 30.0, 0.01, 0.03},
+		{"policy-low-prio", 5, 90.0, 0.02, 0.06},
+	}
+
+	for _, acc := range accounts {
+		createTestAccount(t, ts.Store, acc.id, models.ProviderOpenAI, acc.priority)
+		quota := createTestQuota(t, ts.Store, acc.id, acc.quota, false)
+		_ = quota
+	}
+
+	t.Run("balanced policy", func(t *testing.T) {
+		resp := requestRouterSelect(t, ts.Engine, "openai", "balanced")
+		assert.NotEmpty(t, resp.AccountID)
+	})
+
+	t.Run("cost policy favors lower cost", func(t *testing.T) {
+		resp := requestRouterSelect(t, ts.Engine, "openai", "cost")
+		// policy-high-prio has lower cost (0.01/0.03 vs 0.02/0.06)
+		assert.Equal(t, "policy-high-prio", resp.AccountID)
+	})
+
+	t.Run("performance policy favors higher quota", func(t *testing.T) {
+		resp := requestRouterSelect(t, ts.Engine, "openai", "performance")
+		// policy-low-prio has higher quota (90% vs 30%)
+		assert.Equal(t, "policy-low-prio", resp.AccountID)
+	})
+
+	t.Run("safety policy favors higher quota", func(t *testing.T) {
+		resp := requestRouterSelect(t, ts.Engine, "openai", "safety")
+		// policy-low-prio has higher quota (90% vs 30%)
+		assert.Equal(t, "policy-low-prio", resp.AccountID)
+	})
+}
+
+// TestRouter_AntiFlapping tests anti-flapping behavior
+func TestRouter_AntiFlapping(t *testing.T) {
+	ts := setupTestServerExt(t)
+	defer ts.Cleanup()
+
+	// Create two accounts with similar scores
+	createTestAccount(t, ts.Store, "flap-1", models.ProviderOpenAI, 10)
+	createTestAccount(t, ts.Store, "flap-2", models.ProviderOpenAI, 8)
+
+	quota1 := createTestQuota(t, ts.Store, "flap-1", 50.0, false)
+	quota2 := createTestQuota(t, ts.Store, "flap-2", 51.0, false)
+	_ = quota1
+	_ = quota2
+
+	t.Run("does not switch frequently", func(t *testing.T) {
+		// Select first account
+		resp1 := requestRouterSelect(t, ts.Engine, "openai", "balanced")
+		firstAccount := resp1.AccountID
+
+		// Make several more requests quickly
+		for i := 0; i < 5; i++ {
+			resp := requestRouterSelect(t, ts.Engine, "openai", "balanced")
+			// Should stay on the same account due to anti-flapping
+			assert.Equal(t, firstAccount, resp.AccountID, "Should not switch accounts rapidly")
+		}
+	})
+
+	t.Run("switches when score difference is large", func(t *testing.T) {
+		// Make second account much better
+		quota2 := createTestQuota(t, ts.Store, "flap-2", 95.0, false)
+		_ = quota2
+
+		// Should switch to flap-2
+		resp := requestRouterSelect(t, ts.Engine, "openai", "balanced")
+		assert.Equal(t, "flap-2", resp.AccountID)
+	})
+}
+
+// TestRouter_Exclusion tests account and provider exclusion
+func TestRouter_Exclusion(t *testing.T) {
+	ts := setupTestServerExt(t)
+	defer ts.Cleanup()
+
+	// Create accounts
+	createTestAccount(t, ts.Store, "exclude-1", models.ProviderOpenAI, 10)
+	createTestAccount(t, ts.Store, "exclude-2", models.ProviderOpenAI, 8)
+	createTestAccount(t, ts.Store, "exclude-3", models.ProviderAnthropic, 8)
+
+	createTestQuota(t, ts.Store, "exclude-1", 70.0, false)
+	createTestQuota(t, ts.Store, "exclude-2", 80.0, false)
+	createTestQuota(t, ts.Store, "exclude-3", 90.0, false)
+
+	t.Run("excludes specific accounts", func(t *testing.T) {
+		resp := requestRouterSelect(t, ts.Engine, "openai", "balanced")
+		// Should not select exclude-1
+		assert.NotEqual(t, "exclude-1", resp.AccountID)
+		// Should select exclude-2 (next highest)
+		assert.Equal(t, "exclude-2", resp.AccountID)
+	})
+
+	t.Run("excludes providers", func(t *testing.T) {
+		// Exclude Anthropic
+		body := map[string]interface{}{
+			"provider":          "openai",
+			"exclude_providers": []string{"anthropic"},
+		}
+
+		// Anthropic request should fail
+		w := makeRequest(t, ts.Engine, "POST", "/router/select", body)
+		assert.Equal(t, 503, w.StatusCode)
+	})
+}
+
+// TestRouter_DistributionCalculation tests distribution calculation
+func TestRouter_DistributionCalculation(t *testing.T) {
+	ts := setupTestServerExt(t)
+	defer ts.Cleanup()
+
+	// Create accounts with different quotas
+	for i := 1; i <= 4; i++ {
+		createTestAccount(t, ts.Store, "dist-test-"+string(rune('0'+i)), models.ProviderOpenAI, 11-i)
+		createTestQuota(t, ts.Store, "dist-test-"+string(rune('0'+i)), float64(100-20*i), false)
+	}
+
+	t.Run("calculates optimal distribution", func(t *testing.T) {
+		dist := getDistribution(t, ts.Engine)
+		assert.NotNil(t, dist)
+
+		// Distribution should contain all accounts
+		accounts, ok := dist["accounts"].(map[string]interface{})
+		require.True(t, ok)
+		assert.Len(t, accounts, 4)
+	})
+
+	t.Run("distribution favors higher quota accounts", func(t *testing.T) {
+		dist := getDistribution(t, ts.Engine)
+		accounts, ok := dist["accounts"].(map[string]interface{})
+		require.True(t, ok)
+
+		// Account with highest quota should have higher allocation
+		account1, ok := accounts["dist-test-1"].(map[string]interface{})
+		require.True(t, ok)
+		account4, ok := accounts["dist-test-4"].(map[string]interface{})
+		require.True(t, ok)
+
+		// Higher quota account should have higher weight
+		weight1 := account1["weight"].(float64)
+		weight4 := account4["weight"].(float64)
+		assert.Greater(t, weight1, weight4)
+	})
+}

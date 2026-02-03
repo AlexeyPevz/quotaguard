@@ -1,0 +1,53 @@
+version: "2.1"
+
+server:
+  host: "0.0.0.0"
+  http_port: 8318
+
+collector:
+  mode: "hybrid"
+
+telegram:
+  enabled: false
+  # bot_token and chat_id can be stored in SQLite via /settoken
+
+router:
+  thresholds:
+    warning: 85.0
+    switch: 90.0
+    critical: 95.0
+    min_safe: 5.0
+
+  anti_flapping:
+    min_dwell_time: 5m
+    cooldown_after_switch: 3m
+
+  reservation:
+    enabled: true
+    timeout: 30s
+
+  weights:
+    safety: 0.4
+    refill: 0.2
+    tier: 0.15
+    reliability: 0.15
+    cost: 0.1
+
+accounts:
+  - id: "openai-primary"
+    provider: "openai"
+    tier: "premium"
+    enabled: true
+    priority: 100
+    concurrency_limit: 100
+    input_cost_per_1k: 0.01
+    output_cost_per_1k: 0.03
+
+  - id: "anthropic-secondary"
+    provider: "anthropic"
+    tier: "standard"
+    enabled: true
+    priority: 50
+    concurrency_limit: 50
+    input_cost_per_1k: 0.015
+    output_cost_per_1k: 0.075
