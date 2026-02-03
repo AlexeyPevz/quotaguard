@@ -65,6 +65,26 @@ func (b *Bot) handleCommand(chatID int64, text string) {
 		b.handleForceSwitch(chatID, args)
 	case "/settoken":
 		b.handleSetToken(chatID, args)
+	case "/qg_status":
+		b.biHandleStatus(chatID, args)
+	case "/qg_alerts":
+		b.biHandleAlerts(chatID, args)
+	case "/qg_thresholds":
+		b.biHandleThresholds(chatID, args)
+	case "/qg_policy":
+		b.biHandlePolicy(chatID, args)
+	case "/qg_fallback":
+		b.biHandleFallback(chatID, args)
+	case "/qg_codex_token":
+		b.biHandleCodexToken(chatID, args)
+	case "/qg_codex_status":
+		b.biHandleCodexStatus(chatID, args)
+	case "/qg_import":
+		b.biHandleImport(chatID, args)
+	case "/qg_export":
+		b.biHandleExport(chatID, args)
+	case "/qg_reload":
+		b.biHandleReload(chatID, args)
 	default:
 		b.sendErrorMessage(chatID, fmt.Sprintf("Unknown command: %s. Type /help for available commands.", command))
 	}
@@ -97,6 +117,8 @@ func (b *Bot) handleHelp(chatID int64) {
 
 *Setup*
 /settoken <token> - Store bot token in settings
+/qg_codex_token <session_token> - Store Codex session token
+/qg_codex_status - Show Codex auth status
 
 *General*
 /help - Show this help message

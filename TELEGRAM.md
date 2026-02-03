@@ -44,6 +44,8 @@ for update := range updates {
 - `/qg_fallback` — fallback chains (JSON).
 - `/qg_thresholds` — пороги.
 - `/qg_policy` — политика маршрутизации.
+- `/qg_codex_token <session_token>` — сохранить Codex session token в SQLite.
+- `/qg_codex_status` — проверить, задан ли Codex session token.
 - `/qg_import` — импорт аккаунтов.
 - `/qg_export` — экспорт `config.yaml`.
 - `/qg_reload` — перезагрузка конфигурации.

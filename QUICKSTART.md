@@ -26,3 +26,11 @@
 2. В чате этого бота выполните: `/settoken <bot_token>`
 
 Команды: `/qg_status`, `/qg_thresholds`, `/qg_policy`, `/qg_fallback`.
+
+Если используется Codex (ChatGPT), задайте сессию:
+- `/qg_codex_token <session_token>`
+- Проверка: `/qg_codex_status`
+
+Antigravity (local language server):
+- `QUOTAGUARD_ANTIGRAVITY_PORT` / `QUOTAGUARD_ANTIGRAVITY_CSRF`
+- Либо `QUOTAGUARD_ANTIGRAVITY_START_CMD` для авто‑запуска

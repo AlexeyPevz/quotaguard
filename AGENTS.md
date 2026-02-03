@@ -33,3 +33,11 @@ bash agent-install.sh
 3. Telegram:
    - Включите `telegram.enabled: true`
    - `/settoken <TOKEN>`
+4. Codex (если нужен ChatGPT/Codex usage):
+   - `/qg_codex_token <session_token>`
+   - Проверка: `/qg_codex_status`
+
+### Antigravity авто‑запуск
+Если IDE/сервер не стартуют автоматически, укажите команду запуска:
+- `QUOTAGUARD_ANTIGRAVITY_START_CMD`
+- `QUOTAGUARD_ANTIGRAVITY_START_TIMEOUT` (по умолчанию `15s`)

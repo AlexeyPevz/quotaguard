@@ -17,6 +17,24 @@
 1. Путь задаётся через `QUOTAGUARD_CLIPROXY_AUTH_PATH`
 2. Дискавери запускается при старте и по файловым событиям
 
+## Antigravity (local language server)
+Для автоматического сбора квот нужны:
+- `QUOTAGUARD_ANTIGRAVITY_PORT`
+- `QUOTAGUARD_ANTIGRAVITY_CSRF`
+
+QuotaGuard попробует авто‑детект из процесса, но если не найдёт — задайте вручную.
+
+Авто‑запуск (best effort):
+- `QUOTAGUARD_ANTIGRAVITY_START_CMD` — команда запуска IDE/языкового сервера
+- `QUOTAGUARD_ANTIGRAVITY_START_TIMEOUT` — сколько ждать появления сервера (по умолчанию `15s`)
+
+Если сервер не стартует сам, укажите корректную команду запуска IDE или откройте IDE вручную.
+
+## Codex (ChatGPT)
+Если аккаунт Codex не имеет `session_token` в auth‑файле, можно задать токен через Telegram:
+- `/qg_codex_token <session_token>`
+- Проверка: `/qg_codex_status`
+
 ## Типовые команды
 - `./quotaguard setup /path/to/auths`
 - `./quotaguard serve --config config.yaml`

@@ -111,15 +111,17 @@ func (bi *BotIntegrator) storeChatID(chatID int64) {
 // biRegisterQGBHandlers registers all QuotaGuard-specific handlers
 func biRegisterQGBHandlers(bot *Bot) map[string]CommandHandler {
 	return map[string]CommandHandler{
-		"status":     bot.biHandleStatus,
-		"fallback":   bot.biHandleFallback,
-		"thresholds": bot.biHandleThresholds,
-		"policy":     bot.biHandlePolicy,
-		"alerts":     bot.biHandleAlerts,
-		"import":     bot.biHandleImport,
-		"export":     bot.biHandleExport,
-		"reload":     bot.biHandleReload,
-		"help":       bot.biHandleHelp,
+		"status":       bot.biHandleStatus,
+		"fallback":     bot.biHandleFallback,
+		"thresholds":   bot.biHandleThresholds,
+		"policy":       bot.biHandlePolicy,
+		"alerts":       bot.biHandleAlerts,
+		"codex_token":  bot.biHandleCodexToken,
+		"codex_status": bot.biHandleCodexStatus,
+		"import":       bot.biHandleImport,
+		"export":       bot.biHandleExport,
+		"reload":       bot.biHandleReload,
+		"help":         bot.biHandleHelp,
 	}
 }
 
@@ -182,6 +184,42 @@ func (b *Bot) biHandleFallback(chatID int64, args []string) {
 	}
 
 	b.sendMessage(chatID, "✅ Fallback chains updated.")
+}
+
+// biHandleCodexToken handles /qg_codex_token command
+func (b *Bot) biHandleCodexToken(chatID int64, args []string) {
+	if b.settings == nil {
+		b.sendMessage(chatID, "⚠️ Settings store not configured")
+		return
+	}
+	if len(args) == 0 {
+		b.sendMessage(chatID, "Usage: /qg_codex_token <session_token>")
+		return
+	}
+	token := strings.TrimSpace(args[0])
+	if token == "" {
+		b.sendMessage(chatID, "Codex session token cannot be empty")
+		return
+	}
+	if err := b.settings.Set(store.SettingCodexSessionToken, token); err != nil {
+		b.sendMessage(chatID, fmt.Sprintf("Failed to store Codex token: %v", err))
+		return
+	}
+	b.sendMessage(chatID, "✅ Codex session token saved.")
+}
+
+// biHandleCodexStatus handles /qg_codex_status command
+func (b *Bot) biHandleCodexStatus(chatID int64, args []string) {
+	if b.settings == nil {
+		b.sendMessage(chatID, "⚠️ Settings store not configured")
+		return
+	}
+	token, ok := b.settings.Get(store.SettingCodexSessionToken)
+	if !ok || strings.TrimSpace(token) == "" {
+		b.sendMessage(chatID, "ℹ️ Codex: not configured. Use /qg_codex_token <session_token>.")
+		return
+	}
+	b.sendMessage(chatID, "✅ Codex: session token configured.")
 }
 
 // biHandleThresholds handles /qg_thresholds command
@@ -360,6 +398,8 @@ func (b *Bot) biHandleHelp(chatID int64, args []string) {
 		"/qg_thresholds - Set thresholds\n" +
 		"/qg_policy - Change routing policy\n" +
 		"/qg_alerts - Show active alerts\n" +
+		"/qg_codex_token - Store Codex session token\n" +
+		"/qg_codex_status - Show Codex auth status\n" +
 		"/qg_import - Import CLIProxyAPI accounts\n" +
 		"/qg_export - Export configuration\n" +
 		"/qg_reload - Reload config\n" +

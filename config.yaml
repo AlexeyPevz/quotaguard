@@ -8,7 +8,7 @@ collector:
   mode: "hybrid"
 
 telegram:
-  enabled: false
+  enabled: true
   # bot_token and chat_id can be stored in SQLite via /settoken
 
 router:

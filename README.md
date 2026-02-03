@@ -60,6 +60,8 @@ QuotaGuard сохранит `token` и `chat_id` в SQLite и начнёт от�
 - `/qg_fallback` — текущие fallback chains и обновление через JSON.
 - `/qg_thresholds` — чтение/обновление порогов.
 - `/qg_policy` — чтение/обновление политики.
+- `/qg_codex_token <session_token>` — сохранить Codex session token.
+- `/qg_codex_status` — проверить Codex auth.
 - `/qg_import` — импорт аккаунтов.
 - `/qg_export` — экспорт `config.yaml`.
 - `/qg_reload` — перезагрузка конфигурации.
@@ -69,6 +71,10 @@ QuotaGuard сохранит `token` и `chat_id` в SQLite и начнёт от�
 - `QUOTAGUARD_CONFIG_PATH` — путь к `config.yaml`.
 - `QUOTAGUARD_DB_PATH` — путь к SQLite БД.
 - `QUOTAGUARD_CLIPROXY_AUTH_PATH` — путь к папке auths.
+- `QUOTAGUARD_ANTIGRAVITY_PORT` — порт Antigravity сервера.
+- `QUOTAGUARD_ANTIGRAVITY_CSRF` — CSRF токен Antigravity.
+- `QUOTAGUARD_ANTIGRAVITY_START_CMD` — команда авто‑запуска IDE/сервера.
+- `QUOTAGUARD_ANTIGRAVITY_START_TIMEOUT` — сколько ждать запуска (по умолчанию `15s`).
 - `SHUTDOWN_TIMEOUT` — таймаут graceful shutdown.
 
 ## Docker

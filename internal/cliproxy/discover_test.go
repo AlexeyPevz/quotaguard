@@ -57,6 +57,9 @@ func TestDiscoverAuthFiles(t *testing.T) {
 
 	// Should find 3 valid auth files
 	assert.Len(t, auths, 3)
+	for _, auth := range auths {
+		assert.NotEmpty(t, auth.Path)
+	}
 }
 
 func TestDiscoverAuthFiles_EmptyDir(t *testing.T) {

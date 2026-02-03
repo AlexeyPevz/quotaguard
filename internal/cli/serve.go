@@ -195,6 +195,26 @@ func runServe(cmd *cobra.Command, args []string) error {
 		cfg.Collector.Passive.FlushInterval,
 	)
 
+	// Create active collector (if enabled)
+	var activeCollector *collector.ActiveCollector
+	if cfg.Collector.Mode == "active" || cfg.Collector.Mode == "hybrid" {
+		fetcher := collector.NewProviderFetcher(sqliteStore)
+		activeCfg := collector.Config{
+			Interval:      cfg.Collector.Active.DefaultInterval,
+			Adaptive:      cfg.Collector.Active.Adaptive,
+			Timeout:       cfg.Collector.Active.Timeout,
+			RetryAttempts: cfg.Collector.Active.RetryAttempts,
+			RetryBackoff:  time.Second,
+			CBEnabled:     true,
+			CBThreshold:   3,
+			CBTimeout:     5 * time.Minute,
+		}
+		activeCollector = collector.NewActiveCollector(sqliteStore, fetcher, activeCfg, nil)
+		if err := activeCollector.Start(context.Background()); err != nil {
+			log.Printf("Active collector warning: %v", err)
+		}
+	}
+
 	// Create API server
 	server := api.NewServer(cfg.Server, cfg.API, sqliteStore, routerSvc, reservationMgr, passiveCollector)
 
@@ -204,7 +224,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	// Setup graceful shutdown with all components
-	setupGracefulShutdown(server, tgBot, serveFlags.Timeout)
+	setupGracefulShutdown(server, tgBot, activeCollector, serveFlags.Timeout)
 
 	// Determine address
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.HTTPPort)
@@ -252,7 +272,7 @@ func validateTLSConfig(tls config.TLSConfig) error {
 }
 
 // setupGracefulShutdown handles graceful shutdown of all components
-func setupGracefulShutdown(server *api.Server, bot *telegram.Bot, timeout time.Duration) {
+func setupGracefulShutdown(server *api.Server, bot *telegram.Bot, active *collector.ActiveCollector, timeout time.Duration) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
@@ -273,6 +293,11 @@ func setupGracefulShutdown(server *api.Server, bot *telegram.Bot, timeout time.D
 		if bot != nil {
 			if err := bot.Stop(); err != nil {
 				log.Printf("Error stopping telegram bot: %v", err)
+			}
+		}
+		if active != nil {
+			if err := active.Stop(); err != nil {
+				log.Printf("Error stopping active collector: %v", err)
 			}
 		}
 

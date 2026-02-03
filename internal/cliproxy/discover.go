@@ -18,11 +18,14 @@ type AuthFile struct {
 	AccessToken  string `json:"access_token"`
 	Email        string `json:"email"`
 	Type         string `json:"type"` // antigravity, codex, gemini
+	SessionToken string `json:"session_token,omitempty"`
+	AuthMethod   string `json:"auth_method,omitempty"`
 	ProjectID    string `json:"project_id,omitempty"`
 	Expired      string `json:"expired,omitempty"`
 	ExpiresIn    int64  `json:"expires_in,omitempty"`
 	RefreshToken string `json:"refresh_token,omitempty"`
 	Timestamp    int64  `json:"timestamp"`
+	Path         string `json:"-"`
 }
 
 // ProviderMapping maps CLIProxyAPI auth types to QuotaGuard providers
@@ -111,6 +114,7 @@ func DiscoverAuthFiles(authsPath string) ([]AuthFile, error) {
 			continue
 		}
 
+		auth.Path = filepath.Join(authsPath, entry.Name())
 		auths = append(auths, auth)
 	}
 
@@ -123,10 +127,11 @@ func ConvertToAccount(auth AuthFile) *models.Account {
 	accountID := sanitizeAccountID(auth.Email)
 
 	return &models.Account{
-		ID:       accountID,
-		Provider: provider,
-		Enabled:  true,
-		Priority: getDefaultPriority(provider),
+		ID:             accountID,
+		Provider:       provider,
+		Enabled:        true,
+		Priority:       getDefaultPriority(provider),
+		CredentialsRef: auth.Path,
 	}
 }
 

@@ -3,6 +3,8 @@ package collector
 import (
 	"context"
 	"fmt"
+	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -197,6 +199,9 @@ func (ac *ActiveCollector) Start(ctx context.Context) error {
 	ac.stopCh = make(chan struct{})
 	ac.wg.Add(1)
 	go ac.pollLoop(ctx)
+	if os.Getenv("QUOTAGUARD_COLLECTOR_DEBUG") == "1" {
+		log.Printf("collector: active started interval=%s adaptive=%v", ac.interval, ac.adaptive)
+	}
 
 	return nil
 }
@@ -266,17 +271,29 @@ func (ac *ActiveCollector) poll(ctx context.Context) {
 	failCount := 0
 
 	for _, acc := range accounts {
+		if acc.CredentialsRef == "" {
+			if os.Getenv("QUOTAGUARD_COLLECTOR_DEBUG") == "1" {
+				log.Printf("collector: skip account=%s provider=%s reason=missing_credentials_ref", acc.ID, acc.Provider)
+			}
+			continue
+		}
 		quota, err := ac.fetchWithRetry(ctx, acc.ID)
 		if err != nil {
 			failCount++
 			if ac.metrics != nil {
 				ac.metrics.RecordCollector("fetch", "failure", "active")
 			}
+			if os.Getenv("QUOTAGUARD_COLLECTOR_DEBUG") == "1" {
+				log.Printf("collector: fetch failed account=%s provider=%s err=%v", acc.ID, acc.Provider, err)
+			}
 			continue
 		}
 
 		successCount++
 		ac.store.SetQuota(acc.ID, quota)
+		if os.Getenv("QUOTAGUARD_COLLECTOR_DEBUG") == "1" {
+			log.Printf("collector: quota updated account=%s provider=%s remaining=%.2f%%", acc.ID, acc.Provider, quota.EffectiveRemainingPct)
+		}
 		if ac.metrics != nil {
 			ac.metrics.RecordCollector("fetch", "success", "active")
 			ac.metrics.RecordQuotaUtilization(acc.ID, string(acc.Provider), "all", quota.EffectiveRemainingPct)
@@ -299,6 +316,9 @@ func (ac *ActiveCollector) poll(ctx context.Context) {
 
 	if ac.metrics != nil {
 		ac.metrics.RecordCollector("poll", "success", "active")
+	}
+	if os.Getenv("QUOTAGUARD_COLLECTOR_DEBUG") == "1" {
+		log.Printf("collector: poll complete success=%d fail=%d", successCount, failCount)
 	}
 }
 

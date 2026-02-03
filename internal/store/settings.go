@@ -146,6 +146,7 @@ func (s *SQLiteSettingsStore) SetBool(key string, value bool) error {
 const (
 	SettingTelegramBotToken   = "telegram_bot_token"
 	SettingTelegramChatID     = "telegram_chat_id"
+	SettingCodexSessionToken  = "codex_session_token"
 	SettingThresholdsWarning  = "thresholds_warning"
 	SettingThresholdsSwitch   = "thresholds_switch"
 	SettingThresholdsCritical = "thresholds_critical"
