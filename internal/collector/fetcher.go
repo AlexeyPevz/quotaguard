@@ -108,30 +108,52 @@ type antigravityRequest struct {
 }
 
 type antigravityResponse struct {
-	Response struct {
-		UserStatus struct {
-			Name                   string `json:"name"`
-			Email                  string `json:"email"`
-			CascadeModelConfigData struct {
-				CascadeConfigList []struct {
-					ClientModelConfigs []struct {
-						Label        string `json:"label"`
-						ModelOrAlias struct {
-							Model string `json:"model"`
-						} `json:"modelOrAlias"`
-						QuotaInfo struct {
-							RemainingFraction float64   `json:"remainingFraction"`
-							ResetTime         time.Time `json:"resetTime"`
-						} `json:"quotaInfo"`
-					} `json:"clientModelConfigs"`
-				} `json:"cascadeConfigList"`
-			} `json:"cascadeModelConfigData"`
-		} `json:"userStatus"`
-	} `json:"response"`
+	Response   *antigravityResponseEnvelope `json:"response"`
+	UserStatus antigravityUserStatus        `json:"userStatus"`
+}
+
+type antigravityResponseEnvelope struct {
+	UserStatus antigravityUserStatus `json:"userStatus"`
+}
+
+type antigravityUserStatus struct {
+	Name                   string                  `json:"name"`
+	Email                  string                  `json:"email"`
+	PlanStatus             antigravityPlanStatus   `json:"planStatus"`
+	CascadeModelConfigData antigravityCascadeModel `json:"cascadeModelConfigData"`
+}
+
+type antigravityPlanStatus struct {
+	AvailablePromptCredits float64             `json:"availablePromptCredits"`
+	AvailableFlowCredits   float64             `json:"availableFlowCredits"`
+	PlanInfo               antigravityPlanInfo `json:"planInfo"`
+}
+
+type antigravityPlanInfo struct {
+	MonthlyPromptCredits float64 `json:"monthlyPromptCredits"`
+	MonthlyFlowCredits   float64 `json:"monthlyFlowCredits"`
+}
+
+type antigravityCascadeModel struct {
+	CascadeConfigList []struct {
+		ClientModelConfigs []antigravityModelConfig `json:"clientModelConfigs"`
+	} `json:"cascadeConfigList"`
+	ClientModelConfigs []antigravityModelConfig `json:"clientModelConfigs"`
+}
+
+type antigravityModelConfig struct {
+	Label        string `json:"label"`
+	ModelOrAlias struct {
+		Model string `json:"model"`
+	} `json:"modelOrAlias"`
+	QuotaInfo struct {
+		RemainingFraction float64   `json:"remainingFraction"`
+		ResetTime         time.Time `json:"resetTime"`
+	} `json:"quotaInfo"`
 }
 
 func (pf *ProviderFetcher) fetchAntigravity(ctx context.Context, acc *models.Account, auth *authFile) (*models.QuotaInfo, error) {
-	port, csrf, err := pf.resolveAntigravityParams(ctx)
+	port, csrf, pid, err := pf.resolveAntigravityParams(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -144,28 +166,23 @@ func (pf *ProviderFetcher) fetchAntigravity(ctx context.Context, acc *models.Acc
 	reqBody.Metadata.ExtensionVersion = "0.1.0"
 
 	payload, _ := json.Marshal(reqBody)
-	url := fmt.Sprintf("https://127.0.0.1:%s/exa.language_server_pb.LanguageServerService/GetUserStatus", port)
+	if port == "" && pid != 0 {
+		if discovered, derr := pf.discoverAntigravityPort(ctx, pid, csrf, payload); derr == nil {
+			port = discovered
+		}
+	}
+	if port == "" {
+		return nil, fmt.Errorf("missing antigravity port")
+	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	parsed, err := pf.fetchAntigravityStatus(ctx, port, csrf, payload)
+	if err != nil && strings.Contains(err.Error(), "antigravity status 404") && pid != 0 {
+		if discovered, derr := pf.discoverAntigravityPort(ctx, pid, csrf, payload); derr == nil && discovered != port {
+			parsed, err = pf.fetchAntigravityStatus(ctx, discovered, csrf, payload)
+			port = discovered
+		}
+	}
 	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Connect-Protocol-Version", "1")
-	req.Header.Set("X-Codeium-Csrf-Token", csrf)
-
-	resp, err := pf.insecureTLS.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("antigravity status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var parsed antigravityResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
 		return nil, err
 	}
 
@@ -173,17 +190,39 @@ func (pf *ProviderFetcher) fetchAntigravity(ctx context.Context, acc *models.Acc
 	resetAt := (*time.Time)(nil)
 	found := false
 
-	for _, cfg := range parsed.Response.UserStatus.CascadeModelConfigData.CascadeConfigList {
-		for _, modelCfg := range cfg.ClientModelConfigs {
-			if !found || modelCfg.QuotaInfo.RemainingFraction < remainingPct/100 {
-				remainingPct = modelCfg.QuotaInfo.RemainingFraction * 100
-				resetAt = &modelCfg.QuotaInfo.ResetTime
-				found = true
-			}
+	userStatus := parsed.UserStatus
+	if parsed.Response != nil {
+		userStatus = parsed.Response.UserStatus
+	}
+
+	modelConfigs := userStatus.CascadeModelConfigData.ClientModelConfigs
+	if len(modelConfigs) == 0 {
+		for _, cfg := range userStatus.CascadeModelConfigData.CascadeConfigList {
+			modelConfigs = append(modelConfigs, cfg.ClientModelConfigs...)
 		}
 	}
 
-	responseEmail := strings.TrimSpace(parsed.Response.UserStatus.Email)
+	for _, modelCfg := range modelConfigs {
+		if modelCfg.QuotaInfo.RemainingFraction <= 0 {
+			continue
+		}
+		if !found || modelCfg.QuotaInfo.RemainingFraction < remainingPct/100 {
+			remainingPct = modelCfg.QuotaInfo.RemainingFraction * 100
+			resetAt = &modelCfg.QuotaInfo.ResetTime
+			found = true
+		}
+	}
+
+	if !found {
+		limit := userStatus.PlanStatus.PlanInfo.MonthlyPromptCredits
+		remaining := userStatus.PlanStatus.AvailablePromptCredits
+		if limit > 0 && remaining >= 0 {
+			remainingPct = (remaining / limit) * 100
+			found = true
+		}
+	}
+
+	responseEmail := strings.TrimSpace(userStatus.Email)
 	if responseEmail != "" && auth.Email != "" && !strings.EqualFold(responseEmail, auth.Email) {
 		return nil, fmt.Errorf("antigravity session email mismatch: got %s expected %s", responseEmail, auth.Email)
 	}
@@ -223,14 +262,134 @@ func (pf *ProviderFetcher) fetchAntigravity(ctx context.Context, acc *models.Acc
 	return quota, nil
 }
 
-func (pf *ProviderFetcher) resolveAntigravityParams(ctx context.Context) (string, string, error) {
+func (pf *ProviderFetcher) fetchAntigravityStatus(ctx context.Context, port, csrf string, payload []byte) (*antigravityResponse, error) {
+	endpoint := fmt.Sprintf("https://127.0.0.1:%s/exa.language_server_pb.LanguageServerService/GetUserStatus", port)
+	resp, err := pf.doAntigravityRequest(ctx, endpoint, csrf, payload, pf.insecureTLS)
+	if err != nil {
+		if strings.Contains(err.Error(), "http: server gave HTTP response to HTTPS client") {
+			httpEndpoint := fmt.Sprintf("http://127.0.0.1:%s/exa.language_server_pb.LanguageServerService/GetUserStatus", port)
+			resp, err = pf.doAntigravityRequest(ctx, httpEndpoint, csrf, payload, pf.httpClient)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("antigravity status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var parsed antigravityResponse
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, err
+	}
+	return &parsed, nil
+}
+
+func (pf *ProviderFetcher) doAntigravityRequest(ctx context.Context, url, csrf string, payload []byte, client *http.Client) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Connect-Protocol-Version", "1")
+	req.Header.Set("X-Codeium-Csrf-Token", csrf)
+
+	return client.Do(req)
+}
+
+func (pf *ProviderFetcher) discoverAntigravityPort(ctx context.Context, pid int, csrf string, payload []byte) (string, error) {
+	ports := listListeningPorts(pid)
+	if len(ports) == 0 {
+		return "", fmt.Errorf("antigravity: no listening ports found for pid %d", pid)
+	}
+
+	for _, port := range ports {
+		endpoint := fmt.Sprintf("http://127.0.0.1:%s/exa.language_server_pb.LanguageServerService/GetUserStatus", port)
+		resp, err := pf.doAntigravityRequest(ctx, endpoint, csrf, payload, pf.httpClient)
+		if err != nil {
+			continue
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			log.Printf("antigravity: discovered api port %s (pid %d)", port, pid)
+			return port, nil
+		}
+	}
+
+	return "", fmt.Errorf("antigravity: unable to probe api port for pid %d", pid)
+}
+
+func listListeningPorts(pid int) []string {
+	inodes := map[string]struct{}{}
+	fdDir := fmt.Sprintf("/proc/%d/fd", pid)
+	fdEntries, err := os.ReadDir(fdDir)
+	if err != nil {
+		return nil
+	}
+	for _, entry := range fdEntries {
+		link, err := os.Readlink(filepath.Join(fdDir, entry.Name()))
+		if err != nil {
+			continue
+		}
+		if strings.HasPrefix(link, "socket:[") && strings.HasSuffix(link, "]") {
+			inode := strings.TrimSuffix(strings.TrimPrefix(link, "socket:["), "]")
+			if inode != "" {
+				inodes[inode] = struct{}{}
+			}
+		}
+	}
+
+	var ports []string
+	for _, path := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		lines := strings.Split(string(data), "\n")
+		for i, line := range lines {
+			if i == 0 || strings.TrimSpace(line) == "" {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) < 10 {
+				continue
+			}
+			inode := fields[9]
+			if _, ok := inodes[inode]; !ok {
+				continue
+			}
+			local := fields[1]
+			state := fields[3]
+			if state != "0A" {
+				continue
+			}
+			parts := strings.Split(local, ":")
+			if len(parts) != 2 {
+				continue
+			}
+			portHex := parts[1]
+			port, err := strconv.ParseInt(portHex, 16, 32)
+			if err != nil || port <= 0 {
+				continue
+			}
+			ports = append(ports, strconv.Itoa(int(port)))
+		}
+	}
+
+	return ports
+}
+
+func (pf *ProviderFetcher) resolveAntigravityParams(ctx context.Context) (string, string, int, error) {
 	port := os.Getenv("QUOTAGUARD_ANTIGRAVITY_PORT")
 	csrf := os.Getenv("QUOTAGUARD_ANTIGRAVITY_CSRF")
 	if port != "" && csrf != "" {
-		return port, csrf, nil
+		return port, csrf, 0, nil
 	}
 
-	foundPort, foundCSRF := scanAntigravityProcess()
+	foundPort, foundCSRF, pid := scanAntigravityProcess()
 	if port == "" && foundPort != "" {
 		port = foundPort
 		log.Printf("antigravity: auto-detected port %s", port)
@@ -245,7 +404,7 @@ func (pf *ProviderFetcher) resolveAntigravityParams(ctx context.Context) (string
 			timeout := parseDurationEnv("QUOTAGUARD_ANTIGRAVITY_START_TIMEOUT", 15*time.Second)
 			deadline := time.Now().Add(timeout)
 			for time.Now().Before(deadline) {
-				foundPort, foundCSRF = scanAntigravityProcess()
+				foundPort, foundCSRF, pid = scanAntigravityProcess()
 				if port == "" && foundPort != "" {
 					port = foundPort
 					log.Printf("antigravity: detected port after start %s", port)
@@ -255,24 +414,21 @@ func (pf *ProviderFetcher) resolveAntigravityParams(ctx context.Context) (string
 					log.Printf("antigravity: detected csrf after start")
 				}
 				if port != "" && csrf != "" {
-					return port, csrf, nil
+					return port, csrf, pid, nil
 				}
 				select {
 				case <-ctx.Done():
-					return "", "", ctx.Err()
+					return "", "", 0, ctx.Err()
 				case <-time.After(500 * time.Millisecond):
 				}
 			}
 		}
 	}
 
-	if port == "" {
-		return "", "", fmt.Errorf("missing QUOTAGUARD_ANTIGRAVITY_PORT (auto-detect failed)")
-	}
 	if csrf == "" {
-		return "", "", fmt.Errorf("missing QUOTAGUARD_ANTIGRAVITY_CSRF (auto-detect failed)")
+		return port, "", pid, fmt.Errorf("missing QUOTAGUARD_ANTIGRAVITY_CSRF (auto-detect failed)")
 	}
-	return port, csrf, nil
+	return port, csrf, pid, nil
 }
 
 func (pf *ProviderFetcher) startAntigravityServer(ctx context.Context) bool {
@@ -349,17 +505,18 @@ func parseDurationEnv(key string, fallback time.Duration) time.Duration {
 }
 
 var (
-	antigravityPortRegexp = regexp.MustCompile(`--(?:port|extension_server_port|extension-server-port)(?:=|\\s+)(\\d{4,5})`)
-	antigravityCSRFRegexp = regexp.MustCompile(`(?i)csrf(?:_token|-token)?(?:=|\\s+)([A-Za-z0-9_-]{10,})`)
+	antigravityPortRegexp = regexp.MustCompile(`--(?:port|extension_server_port|extension-server-port)(?:=|\s+)(\d{4,5})`)
+	antigravityCSRFRegexp = regexp.MustCompile(`(?i)csrf(?:_token|-token)?(?:=|\s+)([A-Za-z0-9_-]{10,})`)
 )
 
-func scanAntigravityProcess() (string, string) {
+func scanAntigravityProcess() (string, string, int) {
 	procEntries, err := os.ReadDir("/proc")
 	if err != nil {
-		return "", ""
+		return "", "", 0
 	}
 
 	var port, csrf string
+	var pid int
 
 	for _, entry := range procEntries {
 		if !entry.IsDir() || !isNumeric(entry.Name()) {
@@ -370,14 +527,15 @@ func scanAntigravityProcess() (string, string) {
 			continue
 		}
 		cmd := strings.ReplaceAll(string(cmdline), "\x00", " ")
-		if !strings.Contains(cmd, "language_server") && !strings.Contains(cmd, "antigravity") && !strings.Contains(cmd, "codeium") {
+		if !strings.Contains(cmd, "language_server") && !strings.Contains(cmd, "codeium") {
 			continue
 		}
+		isLanguageServer := strings.Contains(cmd, "language_server")
 
 		if port == "" {
 			if match := antigravityPortRegexp.FindStringSubmatch(cmd); len(match) > 1 {
 				port = match[1]
-			} else if match := regexp.MustCompile(`127\\.0\\.0\\.1:(\\d{4,5})`).FindStringSubmatch(cmd); len(match) > 1 {
+			} else if match := regexp.MustCompile(`127\.0\.0\.1:(\d{4,5})`).FindStringSubmatch(cmd); len(match) > 1 {
 				port = match[1]
 			}
 		}
@@ -404,12 +562,18 @@ func scanAntigravityProcess() (string, string) {
 			}
 		}
 
+		if pid == 0 && isLanguageServer {
+			if parsedPID, err := strconv.Atoi(entry.Name()); err == nil {
+				pid = parsedPID
+			}
+		}
+
 		if port != "" && csrf != "" {
-			return port, csrf
+			return port, csrf, pid
 		}
 	}
 
-	return port, csrf
+	return port, csrf, pid
 }
 
 func isNumeric(value string) bool {

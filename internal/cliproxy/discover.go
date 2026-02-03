@@ -124,7 +124,7 @@ func DiscoverAuthFiles(authsPath string) ([]AuthFile, error) {
 // ConvertToAccount converts an AuthFile to an Account model
 func ConvertToAccount(auth AuthFile) *models.Account {
 	provider := models.Provider(ProviderMapping[auth.Type])
-	accountID := sanitizeAccountID(auth.Email)
+	accountID := sanitizeAccountID(auth.Type + "_" + auth.Email)
 
 	return &models.Account{
 		ID:             accountID,
@@ -204,7 +204,8 @@ func (am *AccountManager) ScanAndSync() (newCount, updatedCount int, err error) 
 	seen := make(map[string]bool)
 
 	for _, auth := range auths {
-		accountID := sanitizeAccountID(auth.Email)
+		accountID := sanitizeAccountID(auth.Type + "_" + auth.Email)
+		legacyID := sanitizeAccountID(auth.Email)
 		seen[accountID] = true
 
 		account := ConvertToAccount(auth)
@@ -214,6 +215,13 @@ func (am *AccountManager) ScanAndSync() (newCount, updatedCount int, err error) 
 			account.Enabled = existing.Enabled
 			account.Priority = existing.Priority
 			am.store.SetAccount(account)
+			updatedCount++
+		} else if legacy, ok := existingMap[legacyID]; ok && legacy.CredentialsRef == auth.Path {
+			// Migrate legacy account ID to provider-specific ID
+			account.Enabled = legacy.Enabled
+			account.Priority = legacy.Priority
+			am.store.SetAccount(account)
+			am.store.DeleteAccount(legacy.ID)
 			updatedCount++
 		} else {
 			// Create new account
