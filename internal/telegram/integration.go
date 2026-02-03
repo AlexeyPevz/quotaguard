@@ -3,6 +3,7 @@ package telegram
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -111,17 +112,18 @@ func (bi *BotIntegrator) storeChatID(chatID int64) {
 // biRegisterQGBHandlers registers all QuotaGuard-specific handlers
 func biRegisterQGBHandlers(bot *Bot) map[string]CommandHandler {
 	return map[string]CommandHandler{
-		"status":       bot.biHandleStatus,
-		"fallback":     bot.biHandleFallback,
-		"thresholds":   bot.biHandleThresholds,
-		"policy":       bot.biHandlePolicy,
-		"alerts":       bot.biHandleAlerts,
-		"codex_token":  bot.biHandleCodexToken,
-		"codex_status": bot.biHandleCodexStatus,
-		"import":       bot.biHandleImport,
-		"export":       bot.biHandleExport,
-		"reload":       bot.biHandleReload,
-		"help":         bot.biHandleHelp,
+		"status":             bot.biHandleStatus,
+		"fallback":           bot.biHandleFallback,
+		"thresholds":         bot.biHandleThresholds,
+		"policy":             bot.biHandlePolicy,
+		"alerts":             bot.biHandleAlerts,
+		"codex_token":        bot.biHandleCodexToken,
+		"codex_status":       bot.biHandleCodexStatus,
+		"antigravity_status": bot.biHandleAntigravityStatus,
+		"import":             bot.biHandleImport,
+		"export":             bot.biHandleExport,
+		"reload":             bot.biHandleReload,
+		"help":               bot.biHandleHelp,
 	}
 }
 
@@ -220,6 +222,33 @@ func (b *Bot) biHandleCodexStatus(chatID int64, args []string) {
 		return
 	}
 	b.sendMessage(chatID, "✅ Codex: session token configured.")
+}
+
+// biHandleAntigravityStatus handles /qg_antigravity_status command
+func (b *Bot) biHandleAntigravityStatus(chatID int64, args []string) {
+	port := strings.TrimSpace(os.Getenv("QUOTAGUARD_ANTIGRAVITY_PORT"))
+	csrf := strings.TrimSpace(os.Getenv("QUOTAGUARD_ANTIGRAVITY_CSRF"))
+	msg := "🛰 Antigravity Status\n\n"
+
+	if port != "" {
+		msg += formatKeyValue("Port", port)
+	} else {
+		msg += formatKeyValue("Port", "not set (auto-detect)")
+	}
+	if csrf != "" {
+		msg += formatKeyValue("CSRF", "set")
+	} else {
+		msg += formatKeyValue("CSRF", "not set (auto-detect)")
+	}
+
+	startCmd := strings.TrimSpace(os.Getenv("QUOTAGUARD_ANTIGRAVITY_START_CMD"))
+	if startCmd != "" {
+		msg += formatKeyValue("Auto-start", "custom command configured")
+	} else {
+		msg += formatKeyValue("Auto-start", "PATH lookup")
+	}
+
+	b.sendMessage(chatID, msg)
 }
 
 // biHandleThresholds handles /qg_thresholds command
@@ -400,6 +429,7 @@ func (b *Bot) biHandleHelp(chatID int64, args []string) {
 		"/qg_alerts - Show active alerts\n" +
 		"/qg_codex_token - Store Codex session token\n" +
 		"/qg_codex_status - Show Codex auth status\n" +
+		"/qg_antigravity_status - Show Antigravity detection status\n" +
 		"/qg_import - Import CLIProxyAPI accounts\n" +
 		"/qg_export - Export configuration\n" +
 		"/qg_reload - Reload config\n" +

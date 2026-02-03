@@ -79,6 +79,8 @@ func (b *Bot) handleCommand(chatID int64, text string) {
 		b.biHandleCodexToken(chatID, args)
 	case "/qg_codex_status":
 		b.biHandleCodexStatus(chatID, args)
+	case "/qg_antigravity_status":
+		b.biHandleAntigravityStatus(chatID, args)
 	case "/qg_import":
 		b.biHandleImport(chatID, args)
 	case "/qg_export":
@@ -119,6 +121,7 @@ func (b *Bot) handleHelp(chatID int64) {
 /settoken <token> - Store bot token in settings
 /qg_codex_token <session_token> - Store Codex session token
 /qg_codex_status - Show Codex auth status
+/qg_antigravity_status - Show Antigravity detection status
 
 *General*
 /help - Show this help message

@@ -62,6 +62,7 @@ QuotaGuard сохранит `token` и `chat_id` в SQLite и начнёт от�
 - `/qg_policy` — чтение/обновление политики.
 - `/qg_codex_token <session_token>` — сохранить Codex session token.
 - `/qg_codex_status` — проверить Codex auth.
+- `/qg_antigravity_status` — статус авто‑детекта Antigravity.
 - `/qg_import` — импорт аккаунтов.
 - `/qg_export` — экспорт `config.yaml`.
 - `/qg_reload` — перезагрузка конфигурации.
