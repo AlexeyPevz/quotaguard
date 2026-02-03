@@ -34,3 +34,4 @@
 Antigravity (local language server):
 - `QUOTAGUARD_ANTIGRAVITY_PORT` / `QUOTAGUARD_ANTIGRAVITY_CSRF`
 - Либо `QUOTAGUARD_ANTIGRAVITY_START_CMD` для авто‑запуска
+- Если команда не задана, QuotaGuard попробует запустить `antigravity` из `PATH`

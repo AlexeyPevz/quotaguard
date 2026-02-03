@@ -278,7 +278,7 @@ func (pf *ProviderFetcher) resolveAntigravityParams(ctx context.Context) (string
 func (pf *ProviderFetcher) startAntigravityServer(ctx context.Context) bool {
 	cmdLine := strings.TrimSpace(os.Getenv("QUOTAGUARD_ANTIGRAVITY_START_CMD"))
 	if cmdLine == "" {
-		return false
+		return pf.startAntigravityFromPath(ctx)
 	}
 
 	cmd := exec.CommandContext(ctx, "sh", "-c", cmdLine)
@@ -289,6 +289,50 @@ func (pf *ProviderFetcher) startAntigravityServer(ctx context.Context) bool {
 		return false
 	}
 	log.Printf("antigravity: start command launched")
+	return true
+}
+
+func (pf *ProviderFetcher) startAntigravityFromPath(ctx context.Context) bool {
+	antigravityPath, err := exec.LookPath("antigravity")
+	if err != nil {
+		return false
+	}
+
+	root := antigravityPath
+	for i := 0; i < 4; i++ {
+		root = filepath.Dir(root)
+	}
+	if root == "" || root == "/" {
+		return false
+	}
+
+	serverPath := filepath.Join(root, "bin", "antigravity-server")
+	if _, err := os.Stat(serverPath); err != nil {
+		return false
+	}
+
+	hash := filepath.Base(root)
+	parent := filepath.Dir(filepath.Dir(root))
+	tokenFile := filepath.Join(parent, "."+hash+".token")
+
+	args := []string{
+		"--start-server",
+		"--host=127.0.0.1",
+		"--port=0",
+		"--connection-token-file", tokenFile,
+		"--telemetry-level", "off",
+		"--enable-remote-auto-shutdown",
+		"--accept-server-license-terms",
+	}
+
+	cmd := exec.CommandContext(ctx, serverPath, args...)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Start(); err != nil {
+		log.Printf("antigravity: auto-start failed: %v", err)
+		return false
+	}
+	log.Printf("antigravity: auto-started via %s", serverPath)
 	return true
 }
 
@@ -305,8 +349,8 @@ func parseDurationEnv(key string, fallback time.Duration) time.Duration {
 }
 
 var (
-	antigravityPortRegexp = regexp.MustCompile(`--port(?:=|\\s+)(\\d{4,5})`)
-	antigravityCSRFRegexp = regexp.MustCompile(`(?i)csrf(?:=|\\s+)([A-Za-z0-9_-]{10,})`)
+	antigravityPortRegexp = regexp.MustCompile(`--(?:port|extension_server_port|extension-server-port)(?:=|\\s+)(\\d{4,5})`)
+	antigravityCSRFRegexp = regexp.MustCompile(`(?i)csrf(?:_token|-token)?(?:=|\\s+)([A-Za-z0-9_-]{10,})`)
 )
 
 func scanAntigravityProcess() (string, string) {

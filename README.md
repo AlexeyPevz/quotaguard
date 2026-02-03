@@ -75,6 +75,7 @@ QuotaGuard сохранит `token` и `chat_id` в SQLite и начнёт от�
 - `QUOTAGUARD_ANTIGRAVITY_CSRF` — CSRF токен Antigravity.
 - `QUOTAGUARD_ANTIGRAVITY_START_CMD` — команда авто‑запуска IDE/сервера.
 - `QUOTAGUARD_ANTIGRAVITY_START_TIMEOUT` — сколько ждать запуска (по умолчанию `15s`).
+- Если `QUOTAGUARD_ANTIGRAVITY_START_CMD` не задана, QuotaGuard попробует запустить `antigravity` из `PATH`.
 - `SHUTDOWN_TIMEOUT` — таймаут graceful shutdown.
 
 ## Docker
