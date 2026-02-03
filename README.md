@@ -11,9 +11,9 @@ QuotaGuard — сервис маршрутизации запросов межд
 - Graceful shutdown.
 
 ## Быстрый старт
-1. Собрать бинарник: `make build`
-2. Запустить сервис: `./quotaguard serve --config config.yaml`
-3. Импортировать аккаунты: `./quotaguard setup /path/to/auths`
+1. `make build`
+2. `./quotaguard serve --config config.yaml`
+3. `./quotaguard setup /path/to/auths`
 4. В Telegram: `/settoken <bot_token>`
 
 ## CLI
@@ -54,3 +54,4 @@ QuotaGuard — сервис маршрутизации запросов межд
 ## Документация
 - `QUICKSTART.md`
 - `RUNBOOK.md`
+- `.github/workflows/ci.yml` — CI для Go

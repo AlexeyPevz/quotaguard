@@ -1,7 +1,7 @@
 # Quickstart (RU)
 
 ## 1. Установка
-1. `git clone <repo>`
+1. `git clone https://github.com/AlexeyPevz/quotaguard.git`
 2. `cd quotaguard`
 3. `make build`
 
