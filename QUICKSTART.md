@@ -16,5 +16,13 @@
 1. `./quotaguard setup /path/to/auths`
 
 ## 5. Telegram
-1. В Telegram: `/settoken <bot_token>`
-2. Команды: `/qg_status`, `/qg_thresholds`, `/qg_policy`, `/qg_fallback`
+### Вариант A — отдельный бот QuotaGuard
+1. Создайте бота в BotFather и получите токен.
+2. В `config.yaml`: `telegram.enabled: true`
+3. В Telegram напишите этому боту: `/settoken <bot_token>`
+
+### Вариант B — ваш существующий бот
+1. Используйте `BotIntegrator` и прокидывайте updates в QuotaGuard.
+2. В чате этого бота выполните: `/settoken <bot_token>`
+
+Команды: `/qg_status`, `/qg_thresholds`, `/qg_policy`, `/qg_fallback`.
