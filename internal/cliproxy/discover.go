@@ -18,6 +18,10 @@ type AuthFile struct {
 	AccessToken  string `json:"access_token"`
 	Email        string `json:"email"`
 	Type         string `json:"type"` // antigravity, codex, gemini
+	ClientID     string `json:"client_id,omitempty"`
+	ClientSecret string `json:"client_secret,omitempty"`
+	TokenURI     string `json:"token_uri,omitempty"`
+	Expiry       string `json:"expiry,omitempty"`
 	SessionToken string `json:"session_token,omitempty"`
 	AuthMethod   string `json:"auth_method,omitempty"`
 	ProjectID    string `json:"project_id,omitempty"`
@@ -26,6 +30,17 @@ type AuthFile struct {
 	RefreshToken string `json:"refresh_token,omitempty"`
 	Timestamp    int64  `json:"timestamp"`
 	Path         string `json:"-"`
+	Token        struct {
+		AccessToken  string   `json:"access_token,omitempty"`
+		RefreshToken string   `json:"refresh_token,omitempty"`
+		ClientID     string   `json:"client_id,omitempty"`
+		ClientSecret string   `json:"client_secret,omitempty"`
+		TokenURI     string   `json:"token_uri,omitempty"`
+		Expiry       string   `json:"expiry,omitempty"`
+		ExpiresIn    int64    `json:"expires_in,omitempty"`
+		TokenType    string   `json:"token_type,omitempty"`
+		Scopes       []string `json:"scopes,omitempty"`
+	} `json:"token,omitempty"`
 }
 
 // ProviderMapping maps CLIProxyAPI auth types to QuotaGuard providers
@@ -109,6 +124,29 @@ func DiscoverAuthFiles(authsPath string) ([]AuthFile, error) {
 			continue
 		}
 
+		// Normalize nested token fields (CLIProxy often stores OAuth under "token")
+		if auth.AccessToken == "" && auth.Token.AccessToken != "" {
+			auth.AccessToken = auth.Token.AccessToken
+		}
+		if auth.RefreshToken == "" && auth.Token.RefreshToken != "" {
+			auth.RefreshToken = auth.Token.RefreshToken
+		}
+		if auth.ClientID == "" && auth.Token.ClientID != "" {
+			auth.ClientID = auth.Token.ClientID
+		}
+		if auth.ClientSecret == "" && auth.Token.ClientSecret != "" {
+			auth.ClientSecret = auth.Token.ClientSecret
+		}
+		if auth.TokenURI == "" && auth.Token.TokenURI != "" {
+			auth.TokenURI = auth.Token.TokenURI
+		}
+		if auth.Expiry == "" && auth.Token.Expiry != "" {
+			auth.Expiry = auth.Token.Expiry
+		}
+		if auth.ExpiresIn == 0 && auth.Token.ExpiresIn > 0 {
+			auth.ExpiresIn = auth.Token.ExpiresIn
+		}
+
 		// Check if provider is supported
 		if _, ok := ProviderMapping[auth.Type]; !ok {
 			continue
@@ -140,6 +178,15 @@ func ConvertToCredentials(auth AuthFile) *models.AccountCredentials {
 	rawAuth := auth
 	rawAuth.Path = ""
 	rawJSON, _ := json.Marshal(rawAuth)
+	var expiryMs int64
+	if auth.Expiry != "" {
+		if parsed, err := time.Parse(time.RFC3339Nano, auth.Expiry); err == nil {
+			expiryMs = parsed.UnixMilli()
+		}
+	}
+	if expiryMs == 0 && auth.ExpiresIn > 0 {
+		expiryMs = time.Now().Add(time.Duration(auth.ExpiresIn) * time.Second).UnixMilli()
+	}
 	return &models.AccountCredentials{
 		Type:         auth.Type,
 		Email:        auth.Email,
@@ -147,6 +194,10 @@ func ConvertToCredentials(auth AuthFile) *models.AccountCredentials {
 		RefreshToken: auth.RefreshToken,
 		SessionToken: auth.SessionToken,
 		ProjectID:    auth.ProjectID,
+		ClientID:     auth.ClientID,
+		ClientSecret: auth.ClientSecret,
+		TokenURI:     auth.TokenURI,
+		ExpiryDateMs: expiryMs,
 		Raw:          string(rawJSON),
 	}
 }
