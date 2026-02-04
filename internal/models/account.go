@@ -19,17 +19,18 @@ const (
 
 // Account represents an LLM provider account.
 type Account struct {
-	ID               string    `json:"id"`
-	Provider         Provider  `json:"provider"`
-	Tier             string    `json:"tier"`
-	Enabled          bool      `json:"enabled"`
-	Priority         int       `json:"priority"`
-	ConcurrencyLimit int       `json:"concurrency_limit"`
-	InputCost        float64   `json:"input_cost_per_1k"`  // per 1K tokens
-	OutputCost       float64   `json:"output_cost_per_1k"` // per 1K tokens
-	CredentialsRef   string    `json:"credentials_ref"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ID               string     `json:"id"`
+	Provider         Provider   `json:"provider"`
+	Tier             string     `json:"tier"`
+	Enabled          bool       `json:"enabled"`
+	Priority         int        `json:"priority"`
+	ConcurrencyLimit int        `json:"concurrency_limit"`
+	InputCost        float64    `json:"input_cost_per_1k"`  // per 1K tokens
+	OutputCost       float64    `json:"output_cost_per_1k"` // per 1K tokens
+	CredentialsRef   string     `json:"credentials_ref"`
+	BlockedUntil     *time.Time `json:"blocked_until,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
 }
 
 // Validate checks if the account is valid.

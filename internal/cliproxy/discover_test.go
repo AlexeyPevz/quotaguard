@@ -91,7 +91,7 @@ func TestConvertToAccount(t *testing.T) {
 				Type:  "antigravity",
 			},
 			expected: &models.Account{
-				ID:       "test_at_example_com",
+				ID:       "antigravity_test_at_example_com",
 				Provider: models.ProviderAnthropic,
 				Enabled:  true,
 				Priority: 90,
@@ -104,7 +104,7 @@ func TestConvertToAccount(t *testing.T) {
 				Type:  "codex",
 			},
 			expected: &models.Account{
-				ID:       "user_at_openai_com",
+				ID:       "codex_user_at_openai_com",
 				Provider: models.ProviderOpenAI,
 				Enabled:  true,
 				Priority: 80,
@@ -117,7 +117,7 @@ func TestConvertToAccount(t *testing.T) {
 				Type:  "gemini",
 			},
 			expected: &models.Account{
-				ID:       "googler_at_gmail_com",
+				ID:       "gemini_googler_at_gmail_com",
 				Provider: models.ProviderGemini,
 				Enabled:  true,
 				Priority: 70,
@@ -196,7 +196,7 @@ func TestAccountManager_ScanAndSync(t *testing.T) {
 	assert.Equal(t, 0, updatedCount)
 
 	// Verify account was created
-	account, ok := memStore.GetAccount("manager_test_at_example_com")
+	account, ok := memStore.GetAccount("antigravity_manager_test_at_example_com")
 	assert.True(t, ok)
 	assert.Equal(t, models.ProviderAnthropic, account.Provider)
 

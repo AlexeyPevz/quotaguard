@@ -135,6 +135,21 @@ func ConvertToAccount(auth AuthFile) *models.Account {
 	}
 }
 
+func ConvertToCredentials(auth AuthFile) *models.AccountCredentials {
+	rawAuth := auth
+	rawAuth.Path = ""
+	rawJSON, _ := json.Marshal(rawAuth)
+	return &models.AccountCredentials{
+		Type:         auth.Type,
+		Email:        auth.Email,
+		AccessToken:  auth.AccessToken,
+		RefreshToken: auth.RefreshToken,
+		SessionToken: auth.SessionToken,
+		ProjectID:    auth.ProjectID,
+		Raw:          string(rawJSON),
+	}
+}
+
 // sanitizeAccountID creates a safe account ID from email
 func sanitizeAccountID(email string) string {
 	// Remove special characters and lowercase
@@ -209,23 +224,27 @@ func (am *AccountManager) ScanAndSync() (newCount, updatedCount int, err error) 
 		seen[accountID] = true
 
 		account := ConvertToAccount(auth)
+		creds := ConvertToCredentials(auth)
 
 		if existing, ok := existingMap[accountID]; ok {
 			// Update existing account
 			account.Enabled = existing.Enabled
 			account.Priority = existing.Priority
 			am.store.SetAccount(account)
+			_ = am.store.SetAccountCredentials(account.ID, creds)
 			updatedCount++
 		} else if legacy, ok := existingMap[legacyID]; ok && legacy.CredentialsRef == auth.Path {
 			// Migrate legacy account ID to provider-specific ID
 			account.Enabled = legacy.Enabled
 			account.Priority = legacy.Priority
 			am.store.SetAccount(account)
+			_ = am.store.SetAccountCredentials(account.ID, creds)
 			am.store.DeleteAccount(legacy.ID)
 			updatedCount++
 		} else {
 			// Create new account
 			am.store.SetAccount(account)
+			_ = am.store.SetAccountCredentials(account.ID, creds)
 			newCount++
 		}
 	}

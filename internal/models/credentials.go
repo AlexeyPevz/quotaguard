@@ -1,0 +1,20 @@
+package models
+
+import "time"
+
+// AccountCredentials stores auth material for an account.
+// This is persisted in SQLite and used by active collectors.
+type AccountCredentials struct {
+	AccountID    string    `json:"account_id"`
+	Type         string    `json:"type"`
+	Email        string    `json:"email,omitempty"`
+	AccessToken  string    `json:"access_token,omitempty"`
+	RefreshToken string    `json:"refresh_token,omitempty"`
+	SessionToken string    `json:"session_token,omitempty"`
+	APIKey       string    `json:"api_key,omitempty"`
+	ProjectID    string    `json:"project_id,omitempty"`
+	ClientID     string    `json:"client_id,omitempty"`
+	ClientSecret string    `json:"client_secret,omitempty"`
+	Raw          string    `json:"raw,omitempty"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}

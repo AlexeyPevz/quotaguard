@@ -2,13 +2,14 @@ package collector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"sync"
 	"time"
 
-	"github.com/quotaguard/quotaguard/internal/errors"
+	qerrors "github.com/quotaguard/quotaguard/internal/errors"
 	"github.com/quotaguard/quotaguard/internal/metrics"
 	"github.com/quotaguard/quotaguard/internal/models"
 	"github.com/quotaguard/quotaguard/internal/store"
@@ -28,6 +29,8 @@ type ActiveCollector struct {
 	timeout       time.Duration
 	retryAttempts int
 	retryBackoff  time.Duration
+	workerCount   int
+	jitter        time.Duration
 
 	// Metrics
 	metrics *metrics.Metrics
@@ -148,6 +151,8 @@ type Config struct {
 	CBEnabled     bool
 	CBThreshold   int
 	CBTimeout     time.Duration
+	WorkerCount   int
+	Jitter        time.Duration
 }
 
 // DefaultConfig returns default configuration
@@ -161,6 +166,8 @@ func DefaultConfig() Config {
 		CBEnabled:     true,
 		CBThreshold:   3,
 		CBTimeout:     5 * time.Minute,
+		WorkerCount:   8,
+		Jitter:        0,
 	}
 }
 
@@ -174,6 +181,8 @@ func NewActiveCollector(s store.Store, fetcher QuotaFetcher, cfg Config, m *metr
 		timeout:         cfg.Timeout,
 		retryAttempts:   cfg.RetryAttempts,
 		retryBackoff:    cfg.RetryBackoff,
+		workerCount:     cfg.WorkerCount,
+		jitter:          cfg.Jitter,
 		cbEnabled:       cfg.CBEnabled,
 		currentInterval: cfg.Interval,
 		metrics:         m,
@@ -192,7 +201,7 @@ func (ac *ActiveCollector) Start(ctx context.Context) error {
 	defer ac.mu.Unlock()
 
 	if ac.running {
-		return &errors.ErrServerStart{Addr: "active-collector", Err: fmt.Errorf("collector already running")}
+		return &qerrors.ErrServerStart{Addr: "active-collector", Err: fmt.Errorf("collector already running")}
 	}
 
 	ac.running = true
@@ -269,36 +278,66 @@ func (ac *ActiveCollector) poll(ctx context.Context) {
 
 	successCount := 0
 	failCount := 0
+	if ac.workerCount <= 0 {
+		ac.workerCount = 4
+	}
+
+	jobs := make(chan *models.Account)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for i := 0; i < ac.workerCount; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for acc := range jobs {
+				if acc.BlockedUntil != nil && time.Now().Before(*acc.BlockedUntil) {
+					if os.Getenv("QUOTAGUARD_COLLECTOR_DEBUG") == "1" {
+						log.Printf("collector: skip account=%s provider=%s reason=blocked_until", acc.ID, acc.Provider)
+					}
+					continue
+				}
+				if ac.jitter > 0 {
+					time.Sleep(time.Duration(time.Now().UnixNano()%int64(ac.jitter)) * time.Nanosecond)
+				}
+				quota, err := ac.fetchWithRetry(ctx, acc.ID)
+				if err != nil {
+					if rl := new(RateLimitError); errors.As(err, &rl) {
+						blockedUntil := time.Now().Add(rl.RetryAfter)
+						_ = ac.store.SetAccountBlockedUntil(acc.ID, &blockedUntil)
+					}
+					mu.Lock()
+					failCount++
+					mu.Unlock()
+					if ac.metrics != nil {
+						ac.metrics.RecordCollector("fetch", "failure", "active")
+					}
+					if os.Getenv("QUOTAGUARD_COLLECTOR_DEBUG") == "1" {
+						log.Printf("collector: fetch failed account=%s provider=%s err=%v", acc.ID, acc.Provider, err)
+					}
+					continue
+				}
+
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+				ac.store.SetQuota(acc.ID, quota)
+				if os.Getenv("QUOTAGUARD_COLLECTOR_DEBUG") == "1" {
+					log.Printf("collector: quota updated account=%s provider=%s remaining=%.2f%%", acc.ID, acc.Provider, quota.EffectiveRemainingPct)
+				}
+				if ac.metrics != nil {
+					ac.metrics.RecordCollector("fetch", "success", "active")
+					ac.metrics.RecordQuotaUtilization(acc.ID, string(acc.Provider), "all", quota.EffectiveRemainingPct)
+				}
+			}
+		}(i)
+	}
 
 	for _, acc := range accounts {
-		if acc.CredentialsRef == "" {
-			if os.Getenv("QUOTAGUARD_COLLECTOR_DEBUG") == "1" {
-				log.Printf("collector: skip account=%s provider=%s reason=missing_credentials_ref", acc.ID, acc.Provider)
-			}
-			continue
-		}
-		quota, err := ac.fetchWithRetry(ctx, acc.ID)
-		if err != nil {
-			failCount++
-			if ac.metrics != nil {
-				ac.metrics.RecordCollector("fetch", "failure", "active")
-			}
-			if os.Getenv("QUOTAGUARD_COLLECTOR_DEBUG") == "1" {
-				log.Printf("collector: fetch failed account=%s provider=%s err=%v", acc.ID, acc.Provider, err)
-			}
-			continue
-		}
-
-		successCount++
-		ac.store.SetQuota(acc.ID, quota)
-		if os.Getenv("QUOTAGUARD_COLLECTOR_DEBUG") == "1" {
-			log.Printf("collector: quota updated account=%s provider=%s remaining=%.2f%%", acc.ID, acc.Provider, quota.EffectiveRemainingPct)
-		}
-		if ac.metrics != nil {
-			ac.metrics.RecordCollector("fetch", "success", "active")
-			ac.metrics.RecordQuotaUtilization(acc.ID, string(acc.Provider), "all", quota.EffectiveRemainingPct)
-		}
+		jobs <- acc
 	}
+	close(jobs)
+	wg.Wait()
 
 	// Update circuit breaker
 	if ac.cbEnabled {
@@ -337,6 +376,10 @@ func (ac *ActiveCollector) fetchWithRetry(ctx context.Context, accountID string)
 
 		if err == nil {
 			return quota, nil
+		}
+
+		if rl := new(RateLimitError); errors.As(err, &rl) {
+			return nil, rl
 		}
 
 		lastErr = err

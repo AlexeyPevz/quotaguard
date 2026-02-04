@@ -77,6 +77,10 @@ QuotaGuard сохранит `token` и `chat_id` в SQLite и начнёт от�
 - `QUOTAGUARD_ANTIGRAVITY_START_CMD` — команда авто‑запуска IDE/сервера.
 - `QUOTAGUARD_ANTIGRAVITY_START_TIMEOUT` — сколько ждать запуска (по умолчанию `15s`).
 - Если `QUOTAGUARD_ANTIGRAVITY_START_CMD` не задана, QuotaGuard попробует запустить `antigravity` из `PATH`.
+- `QUOTAGUARD_GOOGLE_CLIENT_ID` / `QUOTAGUARD_GOOGLE_CLIENT_SECRET` — OAuth client для Antigravity (refresh_token).
+- `QUOTAGUARD_UTLS=1` — включить uTLS (имитация браузерного TLS отпечатка).
+- `QUOTAGUARD_COLLECTOR_WORKERS` — воркеры активного коллектора (по умолчанию `8`).
+- `QUOTAGUARD_COLLECTOR_JITTER` — jitter между запросами (например `250ms`).
 - `SHUTDOWN_TIMEOUT` — таймаут graceful shutdown.
 
 ## Docker

@@ -11,8 +11,9 @@ import (
 // It is thread-safe and supports concurrent access.
 type MemoryStore struct {
 	mu           sync.RWMutex
-	quotas       map[string]*models.QuotaInfo   // key: accountID
-	accounts     map[string]*models.Account     // key: accountID
+	quotas       map[string]*models.QuotaInfo // key: accountID
+	accounts     map[string]*models.Account   // key: accountID
+	credentials  map[string]*models.AccountCredentials
 	reservations map[string]*models.Reservation // key: reservationID
 	settings     SettingsStore
 
@@ -26,6 +27,7 @@ func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
 		quotas:       make(map[string]*models.QuotaInfo),
 		accounts:     make(map[string]*models.Account),
+		credentials:  make(map[string]*models.AccountCredentials),
 		reservations: make(map[string]*models.Reservation),
 		subscribers:  make(map[string][]chan models.QuotaEvent),
 		settings:     NewMemorySettingsStore(),
@@ -54,6 +56,20 @@ func (s *MemoryStore) SetAccount(acc *models.Account) {
 	s.accounts[acc.ID] = acc
 }
 
+// SetAccountBlockedUntil updates blocked_until for an account.
+func (s *MemoryStore) SetAccountBlockedUntil(id string, blockedUntil *time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	acc, ok := s.accounts[id]
+	if !ok {
+		return nil
+	}
+	acc.BlockedUntil = blockedUntil
+	s.accounts[id] = acc
+	return nil
+}
+
 // DeleteAccount removes an account
 func (s *MemoryStore) DeleteAccount(id string) bool {
 	s.mu.Lock()
@@ -64,6 +80,7 @@ func (s *MemoryStore) DeleteAccount(id string) bool {
 	}
 	delete(s.accounts, id)
 	delete(s.quotas, id)
+	delete(s.credentials, id)
 	return true
 }
 
@@ -77,6 +94,37 @@ func (s *MemoryStore) ListAccounts() []*models.Account {
 		result = append(result, acc)
 	}
 	return result
+}
+
+// Credentials operations
+func (s *MemoryStore) GetAccountCredentials(accountID string) (*models.AccountCredentials, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	creds, ok := s.credentials[accountID]
+	if !ok {
+		return nil, false
+	}
+	return creds, true
+}
+
+func (s *MemoryStore) SetAccountCredentials(accountID string, creds *models.AccountCredentials) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if creds != nil {
+		creds.AccountID = accountID
+	}
+	s.credentials[accountID] = creds
+	return nil
+}
+
+func (s *MemoryStore) DeleteAccountCredentials(accountID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.credentials, accountID)
+	return nil
 }
 
 // ListEnabledAccounts returns only enabled accounts
@@ -308,9 +356,15 @@ type Store interface {
 	// Account operations
 	GetAccount(id string) (*models.Account, bool)
 	SetAccount(acc *models.Account)
+	SetAccountBlockedUntil(id string, blockedUntil *time.Time) error
 	DeleteAccount(id string) bool
 	ListAccounts() []*models.Account
 	ListEnabledAccounts() []*models.Account
+
+	// Credentials operations
+	GetAccountCredentials(accountID string) (*models.AccountCredentials, bool)
+	SetAccountCredentials(accountID string, creds *models.AccountCredentials) error
+	DeleteAccountCredentials(accountID string) error
 
 	// Quota operations
 	GetQuota(accountID string) (*models.QuotaInfo, bool)

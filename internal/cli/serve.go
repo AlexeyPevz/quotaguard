@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -208,6 +210,8 @@ func runServe(cmd *cobra.Command, args []string) error {
 			CBEnabled:     true,
 			CBThreshold:   3,
 			CBTimeout:     5 * time.Minute,
+			WorkerCount:   envInt("QUOTAGUARD_COLLECTOR_WORKERS", 8),
+			Jitter:        envDuration("QUOTAGUARD_COLLECTOR_JITTER", 250*time.Millisecond),
 		}
 		activeCollector = collector.NewActiveCollector(sqliteStore, fetcher, activeCfg, nil)
 		if err := activeCollector.Start(context.Background()); err != nil {
@@ -315,4 +319,16 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 		return parsed
 	}
 	return fallback
+}
+
+func envInt(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }

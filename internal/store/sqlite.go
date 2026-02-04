@@ -172,6 +172,20 @@ func runMigrations(db *sql.DB) error {
 				ALTER TABLE accounts ADD COLUMN credentials_ref TEXT DEFAULT '';
 			`,
 		},
+		{
+			version: 4,
+			up: `
+				ALTER TABLE accounts ADD COLUMN blocked_until DATETIME;
+
+				CREATE TABLE IF NOT EXISTS account_credentials (
+					account_id TEXT PRIMARY KEY,
+					type TEXT NOT NULL,
+					data TEXT NOT NULL,
+					updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+					FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+				);
+			`,
+		},
 	}
 
 	// Run pending migrations
@@ -281,9 +295,9 @@ func (s *SQLiteStore) GetAccount(id string) (*models.Account, bool) {
 	var acc models.Account
 
 	err := s.db.QueryRow(`
-		SELECT id, provider, enabled, priority, tier, concurrency_limit, input_cost, output_cost, credentials_ref, created_at, updated_at
+		SELECT id, provider, enabled, priority, tier, concurrency_limit, input_cost, output_cost, credentials_ref, blocked_until, created_at, updated_at
 		FROM accounts WHERE id = ?
-	`, id).Scan(&acc.ID, &acc.Provider, &acc.Enabled, &acc.Priority, &acc.Tier, &acc.ConcurrencyLimit, &acc.InputCost, &acc.OutputCost, &acc.CredentialsRef, &acc.CreatedAt, &acc.UpdatedAt)
+	`, id).Scan(&acc.ID, &acc.Provider, &acc.Enabled, &acc.Priority, &acc.Tier, &acc.ConcurrencyLimit, &acc.InputCost, &acc.OutputCost, &acc.CredentialsRef, &acc.BlockedUntil, &acc.CreatedAt, &acc.UpdatedAt)
 
 	if err == sql.ErrNoRows {
 		return nil, false
@@ -302,8 +316,8 @@ func (s *SQLiteStore) SetAccount(acc *models.Account) {
 
 	now := time.Now()
 	_, err := s.db.Exec(`
-		INSERT INTO accounts (id, provider, enabled, priority, tier, concurrency_limit, input_cost, output_cost, credentials_ref, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO accounts (id, provider, enabled, priority, tier, concurrency_limit, input_cost, output_cost, credentials_ref, blocked_until, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			provider = excluded.provider,
 			enabled = excluded.enabled,
@@ -313,12 +327,24 @@ func (s *SQLiteStore) SetAccount(acc *models.Account) {
 			input_cost = excluded.input_cost,
 			output_cost = excluded.output_cost,
 			credentials_ref = excluded.credentials_ref,
+			blocked_until = excluded.blocked_until,
 			updated_at = excluded.updated_at
-	`, acc.ID, acc.Provider, acc.Enabled, acc.Priority, acc.Tier, acc.ConcurrencyLimit, acc.InputCost, acc.OutputCost, acc.CredentialsRef, now, now)
+	`, acc.ID, acc.Provider, acc.Enabled, acc.Priority, acc.Tier, acc.ConcurrencyLimit, acc.InputCost, acc.OutputCost, acc.CredentialsRef, acc.BlockedUntil, now, now)
 
 	if err != nil {
 		s.logger.Error("failed to set account", "error", err.Error())
 	}
+}
+
+// SetAccountBlockedUntil updates blocked_until for an account.
+func (s *SQLiteStore) SetAccountBlockedUntil(id string, blockedUntil *time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`
+		UPDATE accounts SET blocked_until = ?, updated_at = ? WHERE id = ?
+	`, blockedUntil, time.Now(), id)
+	return err
 }
 
 // DeleteAccount removes an account
@@ -341,7 +367,7 @@ func (s *SQLiteStore) ListAccounts() []*models.Account {
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(`
-		SELECT id, provider, enabled, priority, tier, concurrency_limit, input_cost, output_cost, credentials_ref, created_at, updated_at
+		SELECT id, provider, enabled, priority, tier, concurrency_limit, input_cost, output_cost, credentials_ref, blocked_until, created_at, updated_at
 		FROM accounts ORDER BY priority DESC, id
 	`)
 	if err != nil {
@@ -353,7 +379,7 @@ func (s *SQLiteStore) ListAccounts() []*models.Account {
 	for rows.Next() {
 		var acc models.Account
 
-		if err := rows.Scan(&acc.ID, &acc.Provider, &acc.Enabled, &acc.Priority, &acc.Tier, &acc.ConcurrencyLimit, &acc.InputCost, &acc.OutputCost, &acc.CredentialsRef, &acc.CreatedAt, &acc.UpdatedAt); err != nil {
+		if err := rows.Scan(&acc.ID, &acc.Provider, &acc.Enabled, &acc.Priority, &acc.Tier, &acc.ConcurrencyLimit, &acc.InputCost, &acc.OutputCost, &acc.CredentialsRef, &acc.BlockedUntil, &acc.CreatedAt, &acc.UpdatedAt); err != nil {
 			continue
 		}
 
@@ -369,7 +395,7 @@ func (s *SQLiteStore) ListEnabledAccounts() []*models.Account {
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(`
-		SELECT id, provider, enabled, priority, tier, concurrency_limit, input_cost, output_cost, credentials_ref, created_at, updated_at
+		SELECT id, provider, enabled, priority, tier, concurrency_limit, input_cost, output_cost, credentials_ref, blocked_until, created_at, updated_at
 		FROM accounts WHERE enabled = 1 ORDER BY priority DESC, id
 	`)
 	if err != nil {
@@ -381,7 +407,7 @@ func (s *SQLiteStore) ListEnabledAccounts() []*models.Account {
 	for rows.Next() {
 		var acc models.Account
 
-		if err := rows.Scan(&acc.ID, &acc.Provider, &acc.Enabled, &acc.Priority, &acc.Tier, &acc.ConcurrencyLimit, &acc.InputCost, &acc.OutputCost, &acc.CredentialsRef, &acc.CreatedAt, &acc.UpdatedAt); err != nil {
+		if err := rows.Scan(&acc.ID, &acc.Provider, &acc.Enabled, &acc.Priority, &acc.Tier, &acc.ConcurrencyLimit, &acc.InputCost, &acc.OutputCost, &acc.CredentialsRef, &acc.BlockedUntil, &acc.CreatedAt, &acc.UpdatedAt); err != nil {
 			continue
 		}
 
@@ -389,6 +415,71 @@ func (s *SQLiteStore) ListEnabledAccounts() []*models.Account {
 	}
 
 	return accounts
+}
+
+// Credentials operations
+
+// GetAccountCredentials retrieves credentials for an account.
+func (s *SQLiteStore) GetAccountCredentials(accountID string) (*models.AccountCredentials, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var credType string
+	var data string
+	var updatedAt time.Time
+	err := s.db.QueryRow(`
+		SELECT type, data, updated_at FROM account_credentials WHERE account_id = ?
+	`, accountID).Scan(&credType, &data, &updatedAt)
+	if err == sql.ErrNoRows {
+		return nil, false
+	}
+	if err != nil {
+		return nil, false
+	}
+
+	var creds models.AccountCredentials
+	if err := json.Unmarshal([]byte(data), &creds); err != nil {
+		return nil, false
+	}
+	creds.AccountID = accountID
+	creds.Type = credType
+	creds.UpdatedAt = updatedAt
+	return &creds, true
+}
+
+// SetAccountCredentials stores credentials for an account.
+func (s *SQLiteStore) SetAccountCredentials(accountID string, creds *models.AccountCredentials) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if creds == nil {
+		return nil
+	}
+	creds.AccountID = accountID
+	creds.UpdatedAt = time.Now()
+	data, err := json.Marshal(creds)
+	if err != nil {
+		return err
+	}
+
+	_, err = s.db.Exec(`
+		INSERT INTO account_credentials (account_id, type, data, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(account_id) DO UPDATE SET
+			type = excluded.type,
+			data = excluded.data,
+			updated_at = excluded.updated_at
+	`, accountID, creds.Type, string(data), creds.UpdatedAt)
+	return err
+}
+
+// DeleteAccountCredentials removes credentials for an account.
+func (s *SQLiteStore) DeleteAccountCredentials(accountID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`DELETE FROM account_credentials WHERE account_id = ?`, accountID)
+	return err
 }
 
 // Quota operations
