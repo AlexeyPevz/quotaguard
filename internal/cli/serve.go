@@ -134,8 +134,10 @@ func runServe(cmd *cobra.Command, args []string) error {
 	authsPath := cliproxy.ResolveAuthPath("")
 	if authsPath != "" {
 		accountManager = cliproxy.NewAccountManager(sqliteStore, authsPath, 5*time.Minute)
-		if err := accountManager.StartAutoSync(context.Background()); err != nil && globalFlags.Verbose {
+		if err := accountManager.StartAutoSync(context.Background()); err != nil {
 			log.Printf("Auto-discovery warning: %v", err)
+		} else {
+			log.Printf("Auto-discovery enabled: %s", authsPath)
 		}
 	}
 

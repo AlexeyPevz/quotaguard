@@ -13,12 +13,11 @@ QuotaGuard — сервис маршрутизации запросов межд
 ## Быстрый старт
 1. `make build`
 2. `./quotaguard serve --config config.yaml`
-3. `./quotaguard setup /path/to/auths`
-4. В Telegram: `/settoken <bot_token>`
+3. В Telegram: `/settoken <bot_token>`
 
 ## CLI
 - `quotaguard serve --config config.yaml` — запуск сервера.
-- `quotaguard setup [auths_path]` — авто‑дискавери аккаунтов.
+- `quotaguard setup [auths_path]` — разовый импорт аккаунтов (обычно не нужен).
 - `quotaguard quotas` — просмотр квот.
 - `quotaguard check` — быстрый чек.
 
@@ -71,7 +70,7 @@ QuotaGuard сохранит `token` и `chat_id` в SQLite и начнёт от�
 ## Переменные окружения
 - `QUOTAGUARD_CONFIG_PATH` — путь к `config.yaml`.
 - `QUOTAGUARD_DB_PATH` — путь к SQLite БД.
-- `QUOTAGUARD_CLIPROXY_AUTH_PATH` — путь к папке auths.
+- `QUOTAGUARD_CLIPROXY_AUTH_PATH` — путь к папке auths (импорт идёт автоматически при старте).
 - `QUOTAGUARD_ANTIGRAVITY_PORT` — порт Antigravity сервера.
 - `QUOTAGUARD_ANTIGRAVITY_CSRF` — CSRF токен Antigravity.
 - `QUOTAGUARD_ANTIGRAVITY_START_CMD` — команда авто‑запуска IDE/сервера.

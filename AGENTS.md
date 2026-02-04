@@ -33,7 +33,10 @@ bash agent-install.sh
 3. Telegram:
    - Включите `telegram.enabled: true`
    - `/settoken <TOKEN>`
-4. Codex (если нужен ChatGPT/Codex usage):
+4. Авто‑импорт аккаунтов из CLIProxy:
+   - Работает автоматически при старте
+   - `QUOTAGUARD_CLIPROXY_AUTH_PATH` (если путь нестандартный)
+5. Codex (если нужен ChatGPT/Codex usage):
    - `/qg_codex_token <session_token>`
    - Проверка: `/qg_codex_status`
 

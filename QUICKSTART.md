@@ -12,9 +12,6 @@
 ## 3. Запуск
 1. `./quotaguard serve --config config.yaml`
 
-## 4. Импорт аккаунтов
-1. `./quotaguard setup /path/to/auths`
-
 ## 5. Telegram
 ### Вариант A — отдельный бот QuotaGuard
 1. Создайте бота в BotFather и получите токен.
