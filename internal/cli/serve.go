@@ -134,10 +134,20 @@ func runServe(cmd *cobra.Command, args []string) error {
 	authsPath := cliproxy.ResolveAuthPath("")
 	if authsPath != "" {
 		accountManager = cliproxy.NewAccountManager(sqliteStore, authsPath, 5*time.Minute)
-		if err := accountManager.StartAutoSync(context.Background()); err != nil {
+		newCount, updatedCount, err := accountManager.ScanAndSync()
+		if err != nil {
 			log.Printf("Auto-discovery warning: %v", err)
 		} else {
-			log.Printf("Auto-discovery enabled: %s", authsPath)
+			log.Printf("Auto-discovery enabled: %s (new=%d updated=%d)", authsPath, newCount, updatedCount)
+			if cfg.Telegram.Enabled && settingsStore != nil {
+				if chatID := settingsStore.GetInt(store.SettingTelegramChatID, 0); chatID != 0 {
+					msg := fmt.Sprintf("🔄 Auto-import: %d new, %d updated", newCount, updatedCount)
+					telegram.Notify(cfg.Telegram.BotToken, int64(chatID), msg)
+				}
+			}
+		}
+		if err := accountManager.StartAutoSync(context.Background()); err != nil {
+			log.Printf("Auto-discovery warning: %v", err)
 		}
 	}
 

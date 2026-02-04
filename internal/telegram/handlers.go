@@ -122,6 +122,7 @@ func (b *Bot) handleHelp(chatID int64) {
 /qg_codex_token <session_token> - Store Codex session token
 /qg_codex_status - Show Codex auth status
 /qg_antigravity_status - Show Antigravity detection status
+/qg_import - Force import from CLIProxy auths
 
 *General*
 /help - Show this help message

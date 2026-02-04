@@ -35,6 +35,9 @@ func setupTelegramBot(cfg *config.Config, settings store.SettingsStore, s store.
 	}
 
 	bot := telegram.NewBot(cfg.Telegram.BotToken, cfg.Telegram.ChatID, cfg.Telegram.Enabled, options)
+	if accountManager != nil {
+		bot.SetAutoImportEnabled(true)
+	}
 
 	var cfgMu sync.Mutex
 	currentRouterCfg := routerCfg

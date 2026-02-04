@@ -31,7 +31,7 @@ Usage:
 
 Available Commands:
   serve      Start the QuotaGuard server (main mode)
-  setup      Discover CLIProxyAPI auths and sync accounts
+  setup      Force import CLIProxyAPI auths (manual)
   quotas     Show current quotas for all accounts
   check      Zero-config health check
   route      Test routing without execution

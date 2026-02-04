@@ -13,7 +13,7 @@ import (
 var setupCmd = &cobra.Command{
 	Use:     "setup [auths_path]",
 	Aliases: []string{"import", "sync"},
-	Short:   "Discover CLIProxyAPI auths and sync accounts to SQLite",
+	Short:   "Force import CLIProxyAPI auths and sync accounts to SQLite",
 	Args:    cobra.MaximumNArgs(1),
 	RunE:    runSetup,
 }

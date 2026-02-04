@@ -163,6 +163,8 @@ type Bot struct {
 	msgChan   chan Message
 	alertChan chan Alert
 
+	autoImportEnabled bool
+
 	// Callbacks for command handlers
 	onGetStatus            func() (*SystemStatus, error)
 	onGetQuotas            func() ([]AccountQuota, error)
@@ -269,6 +271,11 @@ func NewBot(botToken string, chatID int64, enabled bool, opts *BotOptions) *Bot 
 	}
 
 	return b
+}
+
+// SetAutoImportEnabled sets the auto-import flag for status display.
+func (b *Bot) SetAutoImportEnabled(enabled bool) {
+	b.autoImportEnabled = enabled
 }
 
 // SetStatusCallback sets the callback for getting system status

@@ -47,7 +47,7 @@ for update := range updates {
 - `/qg_codex_token <session_token>` — сохранить Codex session token в SQLite.
 - `/qg_codex_status` — проверить, задан ли Codex session token.
 - `/qg_antigravity_status` — статус авто‑детекта Antigravity.
-- `/qg_import` — импорт аккаунтов.
+- `/qg_import` — форс‑импорт аккаунтов из CLIProxy.
 - `/qg_export` — экспорт `config.yaml`.
 - `/qg_reload` — перезагрузка конфигурации.
 - `/settoken <token>` — сохранить токен и chat_id.

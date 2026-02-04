@@ -138,6 +138,9 @@ func (b *Bot) biHandleStatus(chatID int64, args []string) {
 			status += formatKeyValue("Router Status", s.RouterStatus)
 			status += formatKeyValue("Avg Latency", s.AvgLatency.String())
 			status += formatKeyValue("Last Update", s.LastUpdate.Format("15:04:05"))
+			if b.autoImportEnabled {
+				status += formatKeyValue("Auto-import", "enabled")
+			}
 		}
 	}
 
