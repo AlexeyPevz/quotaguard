@@ -679,9 +679,10 @@ func (pf *ProviderFetcher) ensureOAuthToken(ctx context.Context, accountID strin
 		return "", fmt.Errorf("missing oauth credentials")
 	}
 	if creds.AccessToken == "" {
-		return "", fmt.Errorf("missing access_token")
-	}
-	if creds.ExpiryDateMs > 0 {
+		if creds.RefreshToken == "" {
+			return "", fmt.Errorf("missing access_token")
+		}
+	} else if creds.ExpiryDateMs > 0 {
 		expiry := time.UnixMilli(creds.ExpiryDateMs)
 		if time.Now().Before(expiry.Add(-60 * time.Second)) {
 			return creds.AccessToken, nil
