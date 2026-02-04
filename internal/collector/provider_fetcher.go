@@ -363,14 +363,22 @@ func (pf *ProviderFetcher) fetchGemini(ctx context.Context, acc *models.Account,
 		return nil, err
 	}
 
-	endpoint := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+	projectID := strings.TrimSpace(creds.ProjectID)
+	if projectID == "" {
+		return nil, fmt.Errorf("missing gemini project_id")
+	}
+	if strings.Contains(projectID, ",") {
+		projectID = strings.TrimSpace(strings.Split(projectID, ",")[0])
+	}
+
+	location := "us-central1"
+	endpoint := fmt.Sprintf("https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/publishers/google/models/gemini-2.0-flash:countTokens", location, projectID, location)
 	payload := map[string]interface{}{
 		"contents": []map[string]interface{}{
 			{
 				"parts": []map[string]interface{}{{"text": "q"}},
 			},
 		},
-		"generationConfig": map[string]int{"maxOutputTokens": 1},
 	}
 	body, _ := json.Marshal(payload)
 
