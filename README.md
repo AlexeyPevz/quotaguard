@@ -71,6 +71,8 @@ QuotaGuard сохранит `token` и `chat_id` в SQLite и начнёт от�
 - `QUOTAGUARD_CONFIG_PATH` — путь к `config.yaml`.
 - `QUOTAGUARD_DB_PATH` — путь к SQLite БД.
 - `QUOTAGUARD_CLIPROXY_AUTH_PATH` — путь к папке auths (импорт идёт автоматически при старте).
+- `GEMINI_OAUTH_PATH` — путь(и) к OAuth файлам Gemini CLI (через запятую).
+- `QWEN_OAUTH_PATH` — путь(и) к OAuth файлам Qwen CLI (через запятую).
 - `QUOTAGUARD_ANTIGRAVITY_PORT` — порт Antigravity сервера.
 - `QUOTAGUARD_ANTIGRAVITY_CSRF` — CSRF токен Antigravity.
 - `QUOTAGUARD_ANTIGRAVITY_START_CMD` — команда авто‑запуска IDE/сервера.

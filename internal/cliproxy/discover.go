@@ -129,6 +129,7 @@ func ConvertToAccount(auth AuthFile) *models.Account {
 	return &models.Account{
 		ID:             accountID,
 		Provider:       provider,
+		ProviderType:   auth.Type,
 		Enabled:        true,
 		Priority:       getDefaultPriority(provider),
 		CredentialsRef: auth.Path,

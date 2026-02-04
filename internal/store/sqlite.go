@@ -186,6 +186,13 @@ func runMigrations(db *sql.DB) error {
 				);
 			`,
 		},
+		{
+			version: 5,
+			up: `
+				ALTER TABLE accounts ADD COLUMN provider_type TEXT DEFAULT '';
+				ALTER TABLE accounts ADD COLUMN oauth_creds_path TEXT DEFAULT '';
+			`,
+		},
 	}
 
 	// Run pending migrations
@@ -295,9 +302,9 @@ func (s *SQLiteStore) GetAccount(id string) (*models.Account, bool) {
 	var acc models.Account
 
 	err := s.db.QueryRow(`
-		SELECT id, provider, enabled, priority, tier, concurrency_limit, input_cost, output_cost, credentials_ref, blocked_until, created_at, updated_at
+		SELECT id, provider, provider_type, enabled, priority, tier, concurrency_limit, input_cost, output_cost, credentials_ref, oauth_creds_path, blocked_until, created_at, updated_at
 		FROM accounts WHERE id = ?
-	`, id).Scan(&acc.ID, &acc.Provider, &acc.Enabled, &acc.Priority, &acc.Tier, &acc.ConcurrencyLimit, &acc.InputCost, &acc.OutputCost, &acc.CredentialsRef, &acc.BlockedUntil, &acc.CreatedAt, &acc.UpdatedAt)
+	`, id).Scan(&acc.ID, &acc.Provider, &acc.ProviderType, &acc.Enabled, &acc.Priority, &acc.Tier, &acc.ConcurrencyLimit, &acc.InputCost, &acc.OutputCost, &acc.CredentialsRef, &acc.OAuthCredsPath, &acc.BlockedUntil, &acc.CreatedAt, &acc.UpdatedAt)
 
 	if err == sql.ErrNoRows {
 		return nil, false
@@ -316,10 +323,11 @@ func (s *SQLiteStore) SetAccount(acc *models.Account) {
 
 	now := time.Now()
 	_, err := s.db.Exec(`
-		INSERT INTO accounts (id, provider, enabled, priority, tier, concurrency_limit, input_cost, output_cost, credentials_ref, blocked_until, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO accounts (id, provider, provider_type, enabled, priority, tier, concurrency_limit, input_cost, output_cost, credentials_ref, oauth_creds_path, blocked_until, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			provider = excluded.provider,
+			provider_type = excluded.provider_type,
 			enabled = excluded.enabled,
 			priority = excluded.priority,
 			tier = excluded.tier,
@@ -327,9 +335,10 @@ func (s *SQLiteStore) SetAccount(acc *models.Account) {
 			input_cost = excluded.input_cost,
 			output_cost = excluded.output_cost,
 			credentials_ref = excluded.credentials_ref,
+			oauth_creds_path = excluded.oauth_creds_path,
 			blocked_until = excluded.blocked_until,
 			updated_at = excluded.updated_at
-	`, acc.ID, acc.Provider, acc.Enabled, acc.Priority, acc.Tier, acc.ConcurrencyLimit, acc.InputCost, acc.OutputCost, acc.CredentialsRef, acc.BlockedUntil, now, now)
+	`, acc.ID, acc.Provider, acc.ProviderType, acc.Enabled, acc.Priority, acc.Tier, acc.ConcurrencyLimit, acc.InputCost, acc.OutputCost, acc.CredentialsRef, acc.OAuthCredsPath, acc.BlockedUntil, now, now)
 
 	if err != nil {
 		s.logger.Error("failed to set account", "error", err.Error())
@@ -367,7 +376,7 @@ func (s *SQLiteStore) ListAccounts() []*models.Account {
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(`
-		SELECT id, provider, enabled, priority, tier, concurrency_limit, input_cost, output_cost, credentials_ref, blocked_until, created_at, updated_at
+		SELECT id, provider, provider_type, enabled, priority, tier, concurrency_limit, input_cost, output_cost, credentials_ref, oauth_creds_path, blocked_until, created_at, updated_at
 		FROM accounts ORDER BY priority DESC, id
 	`)
 	if err != nil {
@@ -379,7 +388,7 @@ func (s *SQLiteStore) ListAccounts() []*models.Account {
 	for rows.Next() {
 		var acc models.Account
 
-		if err := rows.Scan(&acc.ID, &acc.Provider, &acc.Enabled, &acc.Priority, &acc.Tier, &acc.ConcurrencyLimit, &acc.InputCost, &acc.OutputCost, &acc.CredentialsRef, &acc.BlockedUntil, &acc.CreatedAt, &acc.UpdatedAt); err != nil {
+		if err := rows.Scan(&acc.ID, &acc.Provider, &acc.ProviderType, &acc.Enabled, &acc.Priority, &acc.Tier, &acc.ConcurrencyLimit, &acc.InputCost, &acc.OutputCost, &acc.CredentialsRef, &acc.OAuthCredsPath, &acc.BlockedUntil, &acc.CreatedAt, &acc.UpdatedAt); err != nil {
 			continue
 		}
 
@@ -395,7 +404,7 @@ func (s *SQLiteStore) ListEnabledAccounts() []*models.Account {
 	defer s.mu.RUnlock()
 
 	rows, err := s.db.Query(`
-		SELECT id, provider, enabled, priority, tier, concurrency_limit, input_cost, output_cost, credentials_ref, blocked_until, created_at, updated_at
+		SELECT id, provider, provider_type, enabled, priority, tier, concurrency_limit, input_cost, output_cost, credentials_ref, oauth_creds_path, blocked_until, created_at, updated_at
 		FROM accounts WHERE enabled = 1 ORDER BY priority DESC, id
 	`)
 	if err != nil {
@@ -407,7 +416,7 @@ func (s *SQLiteStore) ListEnabledAccounts() []*models.Account {
 	for rows.Next() {
 		var acc models.Account
 
-		if err := rows.Scan(&acc.ID, &acc.Provider, &acc.Enabled, &acc.Priority, &acc.Tier, &acc.ConcurrencyLimit, &acc.InputCost, &acc.OutputCost, &acc.CredentialsRef, &acc.BlockedUntil, &acc.CreatedAt, &acc.UpdatedAt); err != nil {
+		if err := rows.Scan(&acc.ID, &acc.Provider, &acc.ProviderType, &acc.Enabled, &acc.Priority, &acc.Tier, &acc.ConcurrencyLimit, &acc.InputCost, &acc.OutputCost, &acc.CredentialsRef, &acc.OAuthCredsPath, &acc.BlockedUntil, &acc.CreatedAt, &acc.UpdatedAt); err != nil {
 			continue
 		}
 

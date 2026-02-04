@@ -18,6 +18,21 @@
 2. Дискавери запускается автоматически при старте и по файловым событиям
 3. Команда `./quotaguard setup` нужна только для ручного форс‑импорта
 
+## Gemini CLI OAuth
+По умолчанию импортируются:
+- `~/.gemini/oauth_creds.json`
+- `~/.config/google-gemini/token.json`
+
+Можно переопределить:
+- `GEMINI_OAUTH_PATH=/path/one.json,/path/two.json`
+
+## Qwen CLI OAuth
+По умолчанию:
+- `~/.qwen/oauth_creds.json`
+
+Переопределение:
+- `QWEN_OAUTH_PATH=/path/qwen.json`
+
 ## Antigravity (local language server)
 Для автоматического сбора квот нужны:
 - `QUOTAGUARD_ANTIGRAVITY_PORT`

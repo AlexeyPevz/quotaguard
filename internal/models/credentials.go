@@ -15,6 +15,10 @@ type AccountCredentials struct {
 	ProjectID    string    `json:"project_id,omitempty"`
 	ClientID     string    `json:"client_id,omitempty"`
 	ClientSecret string    `json:"client_secret,omitempty"`
+	TokenURI     string    `json:"token_uri,omitempty"`
+	ExpiryDateMs int64     `json:"expiry_date,omitempty"`
+	ResourceURL  string    `json:"resource_url,omitempty"`
+	SourcePath   string    `json:"source_path,omitempty"`
 	Raw          string    `json:"raw,omitempty"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }

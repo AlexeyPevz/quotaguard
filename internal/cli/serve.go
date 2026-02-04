@@ -132,22 +132,34 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	var accountManager *cliproxy.AccountManager
 	authsPath := cliproxy.ResolveAuthPath("")
+	oauthNew, oauthUpdated, oauthErr := importOAuthCredentials(sqliteStore)
+	if oauthErr != nil && globalFlags.Verbose {
+		log.Printf("OAuth import warning: %v", oauthErr)
+	}
 	if authsPath != "" {
 		accountManager = cliproxy.NewAccountManager(sqliteStore, authsPath, 5*time.Minute)
 		newCount, updatedCount, err := accountManager.ScanAndSync()
 		if err != nil {
 			log.Printf("Auto-discovery warning: %v", err)
 		} else {
-			log.Printf("Auto-discovery enabled: %s (new=%d updated=%d)", authsPath, newCount, updatedCount)
+			log.Printf("Auto-discovery enabled: %s (new=%d updated=%d, oauth_new=%d oauth_updated=%d)", authsPath, newCount, updatedCount, oauthNew, oauthUpdated)
 			if cfg.Telegram.Enabled && settingsStore != nil {
 				if chatID := settingsStore.GetInt(store.SettingTelegramChatID, 0); chatID != 0 {
-					msg := fmt.Sprintf("🔄 Auto-import: %d new, %d updated", newCount, updatedCount)
+					msg := fmt.Sprintf("🔄 Auto-import: %d new, %d updated (oauth: %d new, %d updated)", newCount, updatedCount, oauthNew, oauthUpdated)
 					telegram.Notify(cfg.Telegram.BotToken, int64(chatID), msg)
 				}
 			}
 		}
 		if err := accountManager.StartAutoSync(context.Background()); err != nil {
 			log.Printf("Auto-discovery warning: %v", err)
+		}
+	} else if oauthNew > 0 || oauthUpdated > 0 {
+		log.Printf("OAuth import complete (oauth_new=%d oauth_updated=%d)", oauthNew, oauthUpdated)
+		if cfg.Telegram.Enabled && settingsStore != nil {
+			if chatID := settingsStore.GetInt(store.SettingTelegramChatID, 0); chatID != 0 {
+				msg := fmt.Sprintf("🔄 Auto-import: 0 new, 0 updated (oauth: %d new, %d updated)", oauthNew, oauthUpdated)
+				telegram.Notify(cfg.Telegram.BotToken, int64(chatID), msg)
+			}
 		}
 	}
 

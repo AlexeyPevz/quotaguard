@@ -116,13 +116,24 @@ func setupTelegramBot(cfg *config.Config, settings store.SettingsStore, s store.
 	})
 
 	bot.SetImportCallback(func(path string) (int, int, error) {
+		var newCount, updatedCount int
 		if accountManager == nil {
-			return 0, 0, fmt.Errorf("account manager not initialized")
+			if path != "" {
+				return 0, 0, fmt.Errorf("account manager not initialized")
+			}
+		} else {
+			if path != "" {
+				accountManager = cliproxy.NewAccountManager(s, path, 5*time.Minute)
+			}
+			n, u, err := accountManager.ScanAndSync()
+			if err != nil {
+				return 0, 0, err
+			}
+			newCount += n
+			updatedCount += u
 		}
-		if path != "" {
-			accountManager = cliproxy.NewAccountManager(s, path, 5*time.Minute)
-		}
-		return accountManager.ScanAndSync()
+		oauthNew, oauthUpdated, _ := importOAuthCredentials(s)
+		return newCount + oauthNew, updatedCount + oauthUpdated, nil
 	})
 
 	bot.SetExportCallback(func() (string, error) {

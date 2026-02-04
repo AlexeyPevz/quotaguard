@@ -355,31 +355,31 @@ func (pf *ProviderFetcher) refreshGoogleAccessToken(ctx context.Context, clientI
 	return parsed.AccessToken, nil
 }
 
-// ---------------- Gemini (countTokens) ----------------
+// ---------------- Gemini (OAuth Soft Probe) ----------------
 
 func (pf *ProviderFetcher) fetchGemini(ctx context.Context, acc *models.Account, creds *models.AccountCredentials) (*models.QuotaInfo, error) {
-	apiKey := strings.TrimSpace(creds.APIKey)
-	if apiKey == "" {
-		return nil, fmt.Errorf("missing api_key")
+	accessToken, err := pf.ensureOAuthToken(ctx, acc.ID, creds, "https://oauth2.googleapis.com/token")
+	if err != nil {
+		return nil, err
 	}
 
-	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:countTokens?key=%s", apiKey)
+	endpoint := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 	payload := map[string]interface{}{
 		"contents": []map[string]interface{}{
 			{
-				"parts": []map[string]string{
-					{"text": "."},
-				},
+				"parts": []map[string]interface{}{{"text": "q"}},
 			},
 		},
+		"generationConfig": map[string]int{"maxOutputTokens": 1},
 	}
 	body, _ := json.Marshal(payload)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
 
 	resp, err := pf.client.Do(req)
 	if err != nil {
@@ -395,69 +395,81 @@ func (pf *ProviderFetcher) fetchGemini(ctx context.Context, acc *models.Account,
 
 	limit, remaining, resetAt := parseRateLimitHeaders(resp.Header)
 	if remaining < 0 {
-		return nil, fmt.Errorf("gemini rate limit headers not found")
+		// fallback to static limits if headers missing
+		limit = 1500
+		remaining = 1500
+		resetAt = nextMidnightUTC()
 	}
 	if limit == 0 {
 		limit = remaining
 	}
-	used := limit - remaining
-	if used < 0 {
-		used = 0
-	}
 
-	return quotaFromNumbers(acc, limit, used, resetAt, 0.5), nil
+	tokensRemaining := parseTokenRemaining(resp.Header)
+	return quotaFromRateLimits(acc, limit, remaining, resetAt, tokensRemaining, 0.45), nil
 }
 
-// ---------------- Qwen (DashScope) ----------------
+// ---------------- Qwen (OAuth Quota Endpoint) ----------------
 
 func (pf *ProviderFetcher) fetchQwen(ctx context.Context, acc *models.Account, creds *models.AccountCredentials) (*models.QuotaInfo, error) {
-	apiKey := strings.TrimSpace(creds.APIKey)
-	if apiKey == "" {
-		return nil, fmt.Errorf("missing api_key")
+	accessToken := strings.TrimSpace(creds.AccessToken)
+	if accessToken == "" {
+		return nil, fmt.Errorf("missing access_token")
+	}
+	if creds.ExpiryDateMs > 0 {
+		expiry := time.UnixMilli(creds.ExpiryDateMs)
+		if time.Now().After(expiry) {
+			return nil, fmt.Errorf("qwen token expired")
+		}
 	}
 
-	payload := map[string]interface{}{
-		"model": "qwen-turbo",
-		"input": map[string]interface{}{
-			"prompt": "ping",
-		},
-		"parameters": map[string]interface{}{
-			"result_format": "message",
-		},
+	endpoints := []string{
+		"https://portal.qwen.ai/v1/account/quota",
+		"https://dashscope-intl.aliyuncs.com/api/v1/account/quota",
 	}
-	body, _ := json.Marshal(payload)
+	var lastErr error
+	for _, endpoint := range endpoints {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Authorization", "Bearer "+accessToken)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation", bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+		resp, err := pf.client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return nil, rateLimitErrorFromHeaders(resp.Header, "qwen rate limit")
+		}
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("qwen status %d", resp.StatusCode)
+			continue
+		}
 
-	resp, err := pf.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, rateLimitErrorFromHeaders(resp.Header, "qwen rate limit")
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("qwen status %d", resp.StatusCode)
+		var result struct {
+			RemainingFreeQuota int `json:"remaining_free_quota"`
+			DailyRequestLimit  int `json:"daily_request_limit"`
+			RequestsUsedToday  int `json:"requests_used_today"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			lastErr = err
+			continue
+		}
+		remaining := result.DailyRequestLimit - result.RequestsUsedToday
+		if remaining < 0 {
+			remaining = 0
+		}
+		resetAt := nextMidnightUTC()
+		return quotaFromRateLimits(acc, result.DailyRequestLimit, remaining, resetAt, 0, 0.5), nil
 	}
 
-	limit, remaining, resetAt := parseRateLimitHeaders(resp.Header)
-	if remaining < 0 {
-		return nil, fmt.Errorf("qwen rate limit headers not found")
+	if lastErr != nil {
+		return nil, lastErr
 	}
-	if limit == 0 {
-		limit = remaining
-	}
-	used := limit - remaining
-	if used < 0 {
-		used = 0
-	}
-	return quotaFromNumbers(acc, limit, used, resetAt, 0.4), nil
+	return nil, fmt.Errorf("qwen quota endpoint failed")
 }
 
 // ---------------- Helpers ----------------
@@ -490,6 +502,59 @@ func quotaFromNumbers(acc *models.Account, limit int, used int, resetAt *time.Ti
 	quota.Tier = acc.Tier
 	quota.Dimensions = models.DimensionSlice{dim}
 	quota.Source = models.SourcePolling
+	quota.Confidence = confidence
+	quota.CollectedAt = time.Now()
+	quota.UpdateEffective()
+	return quota
+}
+
+func quotaFromRateLimits(acc *models.Account, limit int, remaining int, resetAt *time.Time, tokensRemaining int, confidence float64) *models.QuotaInfo {
+	if limit < 0 {
+		limit = 0
+	}
+	if remaining < 0 {
+		remaining = 0
+	}
+	if limit == 0 && remaining > 0 {
+		limit = remaining
+	}
+	used := limit - remaining
+	if used < 0 {
+		used = 0
+	}
+
+	dims := []models.Dimension{
+		{
+			Type:       models.DimensionRPD,
+			Limit:      int64(limit),
+			Used:       int64(used),
+			Remaining:  int64(remaining),
+			ResetAt:    resetAt,
+			Semantics:  models.WindowFixed,
+			Source:     models.SourceHeaders,
+			Confidence: confidence,
+		},
+	}
+
+	if tokensRemaining > 0 {
+		dims = append(dims, models.Dimension{
+			Type:       models.DimensionTPD,
+			Limit:      int64(tokensRemaining),
+			Used:       0,
+			Remaining:  int64(tokensRemaining),
+			ResetAt:    resetAt,
+			Semantics:  models.WindowFixed,
+			Source:     models.SourceHeaders,
+			Confidence: confidence * 0.8,
+		})
+	}
+
+	quota := models.NewQuotaInfo()
+	quota.Provider = acc.Provider
+	quota.AccountID = acc.ID
+	quota.Tier = acc.Tier
+	quota.Dimensions = dims
+	quota.Source = models.SourceHeaders
 	quota.Confidence = confidence
 	quota.CollectedAt = time.Now()
 	quota.UpdateEffective()
@@ -566,15 +631,138 @@ func parseRateLimitHeaders(headers http.Header) (limit int, remaining int, reset
 		remaining = parseInt(remainingVal)
 	}
 	resetVal := headerFirst(headers, "x-ratelimit-reset-requests", "x-goog-ratelimit-reset-requests", "retry-after")
-	if resetVal != "" {
-		if secs, err := strconv.ParseInt(resetVal, 10, 64); err == nil {
-			t := time.Now().Add(time.Duration(secs) * time.Second)
-			resetAt = &t
-		} else if parsed, err := http.ParseTime(resetVal); err == nil {
-			resetAt = &parsed
+	resetAt = parseResetTime(resetVal)
+	return limit, remaining, resetAt
+}
+
+func parseTokenRemaining(headers http.Header) int {
+	value := headerFirst(headers, "x-ratelimit-remaining-tokens", "x-goog-ratelimit-remaining-tokens")
+	if value == "" {
+		return 0
+	}
+	return parseInt(value)
+}
+
+func parseResetTime(value string) *time.Time {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	if parsed, err := http.ParseTime(value); err == nil {
+		return &parsed
+	}
+	if num, err := strconv.ParseInt(value, 10, 64); err == nil {
+		now := time.Now().Unix()
+		switch {
+		case num > 1_000_000_000_000:
+			t := time.UnixMilli(num)
+			return &t
+		case num > now+3600:
+			t := time.Unix(num, 0)
+			return &t
+		default:
+			t := time.Now().Add(time.Duration(num) * time.Second)
+			return &t
 		}
 	}
-	return limit, remaining, resetAt
+	return nil
+}
+
+func nextMidnightUTC() *time.Time {
+	now := time.Now().UTC()
+	next := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
+	return &next
+}
+
+func (pf *ProviderFetcher) ensureOAuthToken(ctx context.Context, accountID string, creds *models.AccountCredentials, defaultTokenURI string) (string, error) {
+	if creds == nil {
+		return "", fmt.Errorf("missing oauth credentials")
+	}
+	if creds.AccessToken == "" {
+		return "", fmt.Errorf("missing access_token")
+	}
+	if creds.ExpiryDateMs > 0 {
+		expiry := time.UnixMilli(creds.ExpiryDateMs)
+		if time.Now().Before(expiry.Add(-60 * time.Second)) {
+			return creds.AccessToken, nil
+		}
+	}
+	if creds.RefreshToken == "" {
+		return creds.AccessToken, nil
+	}
+
+	tokenURI := strings.TrimSpace(creds.TokenURI)
+	if tokenURI == "" {
+		tokenURI = defaultTokenURI
+	}
+
+	form := url.Values{}
+	form.Set("client_id", creds.ClientID)
+	if creds.ClientSecret != "" {
+		form.Set("client_secret", creds.ClientSecret)
+	}
+	form.Set("refresh_token", creds.RefreshToken)
+	form.Set("grant_type", "refresh_token")
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURI, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := pf.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return "", rateLimitErrorFromHeaders(resp.Header, "oauth rate limit")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("oauth status %d", resp.StatusCode)
+	}
+
+	var parsed struct {
+		AccessToken string `json:"access_token"`
+		ExpiresIn   int64  `json:"expires_in"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return "", err
+	}
+	if parsed.AccessToken == "" {
+		return "", errors.New("oauth response missing access_token")
+	}
+	creds.AccessToken = parsed.AccessToken
+	if parsed.ExpiresIn > 0 {
+		creds.ExpiryDateMs = time.Now().Add(time.Duration(parsed.ExpiresIn) * time.Second).UnixMilli()
+	}
+	if pf.store != nil {
+		_ = pf.store.SetAccountCredentials(accountID, creds)
+	}
+	if creds.SourcePath != "" {
+		_ = persistOAuthFile(creds.SourcePath, creds)
+	}
+	return parsed.AccessToken, nil
+}
+
+func persistOAuthFile(path string, creds *models.AccountCredentials) error {
+	if path == "" {
+		return nil
+	}
+	payload := map[string]interface{}{
+		"access_token":  creds.AccessToken,
+		"refresh_token": creds.RefreshToken,
+		"token_uri":     creds.TokenURI,
+		"client_id":     creds.ClientID,
+		"client_secret": creds.ClientSecret,
+		"expiry_date":   creds.ExpiryDateMs,
+		"resource_url":  creds.ResourceURL,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0600)
 }
 
 func rateLimitErrorFromHeaders(headers http.Header, msg string) *RateLimitError {

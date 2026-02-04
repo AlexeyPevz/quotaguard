@@ -13,6 +13,7 @@ const (
 	ProviderOpenAI    Provider = "openai"
 	ProviderAnthropic Provider = "anthropic"
 	ProviderGemini    Provider = "gemini"
+	ProviderQwen      Provider = "qwen"
 	ProviderAzure     Provider = "azure"
 	ProviderOther     Provider = "other"
 )
@@ -21,6 +22,7 @@ const (
 type Account struct {
 	ID               string     `json:"id"`
 	Provider         Provider   `json:"provider"`
+	ProviderType     string     `json:"provider_type"`
 	Tier             string     `json:"tier"`
 	Enabled          bool       `json:"enabled"`
 	Priority         int        `json:"priority"`
@@ -28,6 +30,7 @@ type Account struct {
 	InputCost        float64    `json:"input_cost_per_1k"`  // per 1K tokens
 	OutputCost       float64    `json:"output_cost_per_1k"` // per 1K tokens
 	CredentialsRef   string     `json:"credentials_ref"`
+	OAuthCredsPath   string     `json:"oauth_creds_path"`
 	BlockedUntil     *time.Time `json:"blocked_until,omitempty"`
 	CreatedAt        time.Time  `json:"created_at"`
 	UpdatedAt        time.Time  `json:"updated_at"`
