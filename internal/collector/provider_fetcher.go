@@ -363,16 +363,25 @@ func (pf *ProviderFetcher) fetchGemini(ctx context.Context, acc *models.Account,
 		return nil, err
 	}
 
-	projectID := strings.TrimSpace(creds.ProjectID)
-	if projectID == "" {
+	rawProjectID := strings.TrimSpace(creds.ProjectID)
+	if rawProjectID == "" {
 		return nil, fmt.Errorf("missing gemini project_id")
 	}
-	if strings.Contains(projectID, ",") {
-		projectID = strings.TrimSpace(strings.Split(projectID, ",")[0])
+	projectIDs := []string{rawProjectID}
+	if strings.Contains(rawProjectID, ",") {
+		projectIDs = []string{}
+		for _, p := range strings.Split(rawProjectID, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				projectIDs = append(projectIDs, p)
+			}
+		}
+		if len(projectIDs) == 0 {
+			return nil, fmt.Errorf("missing gemini project_id")
+		}
 	}
 
 	location := "us-central1"
-	endpoint := fmt.Sprintf("https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/publishers/google/models/gemini-2.0-flash:countTokens", location, projectID, location)
 	payload := map[string]interface{}{
 		"contents": []map[string]interface{}{
 			{
@@ -382,38 +391,50 @@ func (pf *ProviderFetcher) fetchGemini(ctx context.Context, acc *models.Account,
 	}
 	body, _ := json.Marshal(payload)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+accessToken)
+	var lastErr error
+	for _, projectID := range projectIDs {
+		endpoint := fmt.Sprintf("https://%s-aiplatform.googleapis.com/v1/projects/%s/locations/%s/publishers/google/models/gemini-2.0-flash:countTokens", location, projectID, location)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+accessToken)
 
-	resp, err := pf.client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, rateLimitErrorFromHeaders(resp.Header, "gemini rate limit")
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("gemini status %d", resp.StatusCode)
+		resp, err := pf.client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			return nil, rateLimitErrorFromHeaders(resp.Header, "gemini rate limit")
+		}
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("gemini status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
+			continue
+		}
+
+		limit, remaining, resetAt := parseRateLimitHeaders(resp.Header)
+		if remaining < 0 {
+			// fallback to static limits if headers missing
+			limit = 1500
+			remaining = 1500
+			resetAt = nextMidnightUTC()
+		}
+		if limit == 0 {
+			limit = remaining
+		}
+
+		tokensRemaining := parseTokenRemaining(resp.Header)
+		return quotaFromRateLimits(acc, limit, remaining, resetAt, tokensRemaining, 0.45), nil
 	}
 
-	limit, remaining, resetAt := parseRateLimitHeaders(resp.Header)
-	if remaining < 0 {
-		// fallback to static limits if headers missing
-		limit = 1500
-		remaining = 1500
-		resetAt = nextMidnightUTC()
+	if lastErr != nil {
+		return nil, lastErr
 	}
-	if limit == 0 {
-		limit = remaining
-	}
-
-	tokensRemaining := parseTokenRemaining(resp.Header)
-	return quotaFromRateLimits(acc, limit, remaining, resetAt, tokensRemaining, 0.45), nil
+	return nil, fmt.Errorf("gemini request failed")
 }
 
 // ---------------- Qwen (OAuth Quota Endpoint) ----------------
