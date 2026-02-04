@@ -29,6 +29,7 @@ type SQLiteStore struct {
 	// Retention cleanup
 	cleanupTicker *time.Ticker
 	cleanupDone   chan struct{}
+	cleanupOnce   sync.Once
 	retentionDays int
 }
 
@@ -265,10 +266,14 @@ func (s *SQLiteStore) cleanupOldData() {
 // Close gracefully shuts down the store
 func (s *SQLiteStore) Close() error {
 	// Stop cleanup goroutine
-	if s.cleanupTicker != nil {
-		s.cleanupTicker.Stop()
-		close(s.cleanupDone)
-	}
+	s.cleanupOnce.Do(func() {
+		if s.cleanupTicker != nil {
+			s.cleanupTicker.Stop()
+		}
+		if s.cleanupDone != nil {
+			close(s.cleanupDone)
+		}
+	})
 
 	// Close all subscriber channels
 	s.subMu.Lock()

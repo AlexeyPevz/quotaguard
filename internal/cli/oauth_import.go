@@ -21,6 +21,8 @@ type geminiOAuthFile struct {
 	ClientSecret string   `json:"client_secret"`
 	Scopes       []string `json:"scopes"`
 	ExpiryDate   int64    `json:"expiry_date"`
+	Type         string   `json:"type"`
+	QuotaProject string   `json:"quota_project_id"`
 }
 
 type qwenOAuthFile struct {
@@ -37,6 +39,7 @@ func importOAuthCredentials(s store.Store) (int, int, error) {
 	geminiPaths := resolveOAuthPaths("GEMINI_OAUTH_PATH", []string{
 		"~/.gemini/oauth_creds.json",
 		"~/.config/google-gemini/token.json",
+		"~/.config/gcloud/application_default_credentials.json",
 	})
 	qwenPaths := resolveOAuthPaths("QWEN_OAUTH_PATH", []string{
 		"~/.qwen/oauth_creds.json",
@@ -113,6 +116,10 @@ func upsertGeminiOAuth(s store.Store, path string) (bool, bool, error) {
 	var file geminiOAuthFile
 	if err := json.Unmarshal(data, &file); err != nil {
 		return false, false, err
+	}
+
+	if file.TokenURI == "" && file.Type == "authorized_user" {
+		file.TokenURI = "https://oauth2.googleapis.com/token"
 	}
 
 	accountID := oauthAccountID("gemini", path)
