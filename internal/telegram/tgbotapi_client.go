@@ -37,6 +37,39 @@ func (c *TGBotAPIClient) SendMessage(chatID int64, text string) error {
 	return err
 }
 
+// SendMessageWithParseMode sends a message with parse mode (HTML/MarkdownV2).
+func (c *TGBotAPIClient) SendMessageWithParseMode(chatID int64, text string, parseMode string) error {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = parseMode
+	_, err := c.bot.Send(msg)
+	return err
+}
+
+// SendMessageWithInlineKeyboard sends a message with an inline keyboard and parse mode.
+func (c *TGBotAPIClient) SendMessageWithInlineKeyboard(chatID int64, text, parseMode string, keyboard InlineKeyboard) error {
+	msg := tgbotapi.NewMessage(chatID, text)
+	if parseMode != "" {
+		msg.ParseMode = parseMode
+	}
+	if keyboard.HasButtons() {
+		rows := make([][]tgbotapi.InlineKeyboardButton, 0, len(keyboard.Rows))
+		for _, row := range keyboard.Rows {
+			btnRow := make([]tgbotapi.InlineKeyboardButton, 0, len(row))
+			for _, btn := range row {
+				if btn.URL != "" {
+					btnRow = append(btnRow, tgbotapi.NewInlineKeyboardButtonURL(btn.Text, btn.URL))
+					continue
+				}
+				btnRow = append(btnRow, tgbotapi.NewInlineKeyboardButtonData(btn.Text, btn.CallbackData))
+			}
+			rows = append(rows, btnRow)
+		}
+		msg.ReplyMarkup = tgbotapi.InlineKeyboardMarkup{InlineKeyboard: rows}
+	}
+	_, err := c.bot.Send(msg)
+	return err
+}
+
 // GetUpdates fetches new updates and converts them to Message.
 func (c *TGBotAPIClient) GetUpdates() ([]Message, error) {
 	c.mu.Lock()

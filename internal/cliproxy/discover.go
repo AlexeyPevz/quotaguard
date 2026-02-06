@@ -23,6 +23,7 @@ type AuthFile struct {
 	TokenURI     string `json:"token_uri,omitempty"`
 	Expiry       string `json:"expiry,omitempty"`
 	SessionToken string `json:"session_token,omitempty"`
+	AccountID    string `json:"account_id,omitempty"`
 	AuthMethod   string `json:"auth_method,omitempty"`
 	ProjectID    string `json:"project_id,omitempty"`
 	Expired      string `json:"expired,omitempty"`
@@ -179,26 +180,36 @@ func ConvertToCredentials(auth AuthFile) *models.AccountCredentials {
 	rawAuth.Path = ""
 	rawJSON, _ := json.Marshal(rawAuth)
 	var expiryMs int64
-	if auth.Expiry != "" {
+	if auth.Expired != "" {
+		if parsed, err := time.Parse(time.RFC3339Nano, auth.Expired); err == nil {
+			expiryMs = parsed.UnixMilli()
+		}
+	}
+	if expiryMs == 0 && auth.Expiry != "" {
 		if parsed, err := time.Parse(time.RFC3339Nano, auth.Expiry); err == nil {
 			expiryMs = parsed.UnixMilli()
 		}
+	}
+	if expiryMs == 0 && auth.Timestamp > 0 && auth.ExpiresIn > 0 {
+		expiryMs = auth.Timestamp + auth.ExpiresIn*1000
 	}
 	if expiryMs == 0 && auth.ExpiresIn > 0 {
 		expiryMs = time.Now().Add(time.Duration(auth.ExpiresIn) * time.Second).UnixMilli()
 	}
 	return &models.AccountCredentials{
-		Type:         auth.Type,
-		Email:        auth.Email,
-		AccessToken:  auth.AccessToken,
-		RefreshToken: auth.RefreshToken,
-		SessionToken: auth.SessionToken,
-		ProjectID:    auth.ProjectID,
-		ClientID:     auth.ClientID,
-		ClientSecret: auth.ClientSecret,
-		TokenURI:     auth.TokenURI,
-		ExpiryDateMs: expiryMs,
-		Raw:          string(rawJSON),
+		Type:              auth.Type,
+		Email:             auth.Email,
+		AccessToken:       auth.AccessToken,
+		RefreshToken:      auth.RefreshToken,
+		SessionToken:      auth.SessionToken,
+		ProviderAccountID: auth.AccountID,
+		ProjectID:         auth.ProjectID,
+		ClientID:          auth.ClientID,
+		ClientSecret:      auth.ClientSecret,
+		TokenURI:          auth.TokenURI,
+		ExpiryDateMs:      expiryMs,
+		SourcePath:        auth.Path,
+		Raw:               string(rawJSON),
 	}
 }
 

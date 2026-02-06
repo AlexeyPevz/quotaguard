@@ -23,6 +23,11 @@ type BotAPI interface {
 	GetUpdates() ([]Message, error)
 }
 
+// ParseModeSender allows sending messages with parse mode (HTML/MarkdownV2).
+type ParseModeSender interface {
+	SendMessageWithParseMode(chatID int64, text string, parseMode string) error
+}
+
 // State represents the FSM state for user conversations
 type State string
 
@@ -31,6 +36,7 @@ const (
 	StateWaitingMute   State = "waiting_mute"
 	StateWaitingSwitch State = "waiting_switch"
 	StateConfirming    State = "confirming"
+	StateWaitingOAuth  State = "waiting_oauth_callback"
 )
 
 // UserSession represents a user conversation session
@@ -166,18 +172,29 @@ type Bot struct {
 	autoImportEnabled bool
 
 	// Callbacks for command handlers
-	onGetStatus            func() (*SystemStatus, error)
-	onGetQuotas            func() ([]AccountQuota, error)
-	onGetAlerts            func() ([]ActiveAlert, error)
-	onMuteAlerts           func(duration time.Duration) error
-	onForceSwitch          func(accountID string) error
-	onGetDailyDigest       func() (*DailyDigest, error)
-	onUpdateThresholds     func(warning, switchVal, critical float64) error
-	onUpdatePolicy         func(policy string) error
-	onUpdateFallbackChains func(chains map[string][]string) error
-	onReloadConfig         func() error
-	onExportConfig         func() (string, error)
-	onImportAccounts       func(path string) (int, int, error)
+	onGetStatus             func() (*SystemStatus, error)
+	onGetQuotas             func() ([]AccountQuota, error)
+	onGetAlerts             func() ([]ActiveAlert, error)
+	onMuteAlerts            func(duration time.Duration) error
+	onForceSwitch           func(accountID string) error
+	onGetDailyDigest        func() (*DailyDigest, error)
+	onUpdateThresholds      func(warning, switchVal, critical float64) error
+	onUpdatePolicy          func(policy string) error
+	onUpdateFallbackChains  func(chains map[string][]string) error
+	onUpdateIgnoreEstimated func(ignore bool) error
+	onGetRouterConfig       func() (*RouterConfig, error)
+	onReloadConfig          func() error
+	onExportConfig          func() (string, error)
+	onImportAccounts        func(path string) (int, int, error)
+	onGetAccounts           func() ([]AccountControl, error)
+	onToggleAccount         func(accountID string, duration time.Duration, enable bool) error
+	onGetAccountCheckConfig func() (*AccountCheckConfig, error)
+	onSetAccountCheckConfig func(interval, timeout time.Duration) error
+	onBuildLoginURL         func(provider string, chatID int64) (*LoginURLPayload, error)
+	onCompleteOAuthLogin    func(provider, state, code string, chatID int64) (*LoginResult, error)
+
+	accountKeyMu sync.RWMutex
+	accountKeys  map[string]string
 }
 
 // SystemStatus represents the system status
@@ -192,8 +209,64 @@ type SystemStatus struct {
 type AccountQuota struct {
 	AccountID    string
 	Provider     string
+	Email        string
 	UsagePercent float64
 	IsWarning    bool
+	Breakdown    []QuotaBreakdown
+	IsActive     bool
+	ResetAt      *time.Time
+	LastCallAt   *time.Time
+}
+
+// RouterConfig represents routing configuration for display and editing.
+type RouterConfig struct {
+	WarningThreshold  float64
+	SwitchThreshold   float64
+	CriticalThreshold float64
+	DefaultPolicy     string
+	IgnoreEstimated   bool
+	FallbackChains    map[string][]string
+}
+
+// QuotaBreakdown represents quota breakdown by group or model.
+type QuotaBreakdown struct {
+	Name         string
+	UsagePercent float64
+	IsWarning    bool
+	ResetAt      *time.Time
+	LastCallAt   *time.Time
+	IsActive     bool
+}
+
+// AccountControl represents account routing control row.
+type AccountControl struct {
+	AccountID     string
+	Provider      string
+	Email         string
+	Enabled       bool
+	DisabledUntil *time.Time
+	IsActive      bool
+}
+
+// AccountCheckConfig represents account availability check settings.
+type AccountCheckConfig struct {
+	Interval time.Duration
+	Timeout  time.Duration
+}
+
+// LoginURLPayload contains OAuth URL and state for Telegram-driven login.
+type LoginURLPayload struct {
+	Provider     string
+	URL          string
+	State        string
+	Instructions string
+}
+
+// LoginResult is returned after OAuth callback exchange.
+type LoginResult struct {
+	AccountID string
+	Email     string
+	Provider  string
 }
 
 // ActiveAlert represents an active alert
@@ -218,14 +291,15 @@ func NewBot(botToken string, chatID int64, enabled bool, opts *BotOptions) *Bot 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	b := &Bot{
-		botToken:  botToken,
-		chatID:    chatID,
-		enabled:   enabled,
-		sessions:  make(map[int64]*UserSession),
-		ctx:       ctx,
-		cancel:    cancel,
-		msgChan:   make(chan Message, 100),
-		alertChan: make(chan Alert, 100),
+		botToken:    botToken,
+		chatID:      chatID,
+		enabled:     enabled,
+		sessions:    make(map[int64]*UserSession),
+		ctx:         ctx,
+		cancel:      cancel,
+		msgChan:     make(chan Message, 100),
+		alertChan:   make(chan Alert, 100),
+		accountKeys: make(map[string]string),
 	}
 
 	if opts != nil {
@@ -323,6 +397,16 @@ func (b *Bot) SetFallbackCallback(cb func(chains map[string][]string) error) {
 	b.onUpdateFallbackChains = cb
 }
 
+// SetIgnoreEstimatedCallback sets the callback for toggling estimated quotas.
+func (b *Bot) SetIgnoreEstimatedCallback(cb func(ignore bool) error) {
+	b.onUpdateIgnoreEstimated = cb
+}
+
+// SetRouterConfigCallback sets the callback for retrieving router configuration.
+func (b *Bot) SetRouterConfigCallback(cb func() (*RouterConfig, error)) {
+	b.onGetRouterConfig = cb
+}
+
 // SetReloadCallback sets the callback for reloading configuration
 func (b *Bot) SetReloadCallback(cb func() error) {
 	b.onReloadConfig = cb
@@ -336,6 +420,34 @@ func (b *Bot) SetExportCallback(cb func() (string, error)) {
 // SetImportCallback sets the callback for importing accounts
 func (b *Bot) SetImportCallback(cb func(path string) (int, int, error)) {
 	b.onImportAccounts = cb
+}
+
+// SetAccountsCallback sets callback for listing routable accounts.
+func (b *Bot) SetAccountsCallback(cb func() ([]AccountControl, error)) {
+	b.onGetAccounts = cb
+}
+
+// SetToggleAccountCallback sets callback for toggling account availability.
+func (b *Bot) SetToggleAccountCallback(cb func(accountID string, duration time.Duration, enable bool) error) {
+	b.onToggleAccount = cb
+}
+
+// SetAccountCheckConfigCallbacks configures callbacks for account availability settings.
+func (b *Bot) SetAccountCheckConfigCallbacks(
+	get func() (*AccountCheckConfig, error),
+	set func(interval, timeout time.Duration) error,
+) {
+	b.onGetAccountCheckConfig = get
+	b.onSetAccountCheckConfig = set
+}
+
+// SetLoginCallbacks configures Telegram-driven login flow callbacks.
+func (b *Bot) SetLoginCallbacks(
+	buildURL func(provider string, chatID int64) (*LoginURLPayload, error),
+	complete func(provider, state, code string, chatID int64) (*LoginResult, error),
+) {
+	b.onBuildLoginURL = buildURL
+	b.onCompleteOAuthLogin = complete
 }
 
 // Start starts the bot
@@ -512,6 +624,44 @@ func (b *Bot) SendMessage(text string) error {
 	return nil
 }
 
+func (b *Bot) sendMessageWithParseMode(chatID int64, text, parseMode string) {
+	if !b.enabled {
+		return
+	}
+	if !b.rateLimiter.Allow() {
+		return
+	}
+	if b.api == nil {
+		return
+	}
+	if sender, ok := b.api.(ParseModeSender); ok {
+		_ = sender.SendMessageWithParseMode(chatID, text, parseMode)
+		return
+	}
+	_ = b.api.SendMessage(chatID, text)
+}
+
+func (b *Bot) sendMessageWithKeyboard(chatID int64, text, parseMode string, keyboard InlineKeyboard) {
+	if !b.enabled {
+		return
+	}
+	if !b.rateLimiter.Allow() {
+		return
+	}
+	if b.api == nil {
+		return
+	}
+	if sender, ok := b.api.(InlineKeyboardSender); ok {
+		_ = sender.SendMessageWithInlineKeyboard(chatID, text, parseMode, keyboard)
+		return
+	}
+	if sender, ok := b.api.(ParseModeSender); ok {
+		_ = sender.SendMessageWithParseMode(chatID, text, parseMode)
+		return
+	}
+	_ = b.api.SendMessage(chatID, text)
+}
+
 // SendAlert sends an alert with deduplication
 func (b *Bot) SendAlert(alert Alert) error {
 	if !b.enabled {
@@ -557,13 +707,21 @@ func (b *Bot) SetSessionState(userID int64, state State, data map[string]interfa
 	b.sessionsMu.Lock()
 	defer b.sessionsMu.Unlock()
 
-	if session, ok := b.sessions[userID]; ok {
-		session.State = state
-		if data != nil {
-			session.Data = data
+	session, ok := b.sessions[userID]
+	if !ok {
+		session = &UserSession{
+			UserID:    userID,
+			State:     StateIdle,
+			Data:      make(map[string]interface{}),
+			UpdatedAt: time.Now(),
 		}
-		session.UpdatedAt = time.Now()
+		b.sessions[userID] = session
 	}
+	session.State = state
+	if data != nil {
+		session.Data = data
+	}
+	session.UpdatedAt = time.Now()
 }
 
 // ClearSession clears a user session

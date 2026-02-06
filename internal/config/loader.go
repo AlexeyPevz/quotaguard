@@ -174,6 +174,7 @@ func Parse(data []byte) (*Config, error) {
 	config.Server.ShutdownTimeout = 30 * time.Second
 	config.Server.LogLevel = "info"
 	config.Server.LogFormat = "json"
+	config.Router.IgnoreEstimated = true
 
 	if err := yaml.Unmarshal(data, &config); err != nil {
 		return nil, &errors.ErrConfigParse{Err: err}

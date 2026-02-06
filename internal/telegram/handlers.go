@@ -2,6 +2,8 @@ package telegram
 
 import (
 	"fmt"
+	"html"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -16,8 +18,17 @@ func (b *Bot) handleMessage(msg Message) {
 		return
 	}
 
-	// Get or create user session
-	session := b.GetSession(msg.ChatID)
+	if session := b.GetSession(msg.ChatID); session != nil && session.State == StateWaitingOAuth {
+		b.handleOAuthCallbackInput(msg.ChatID, text, session)
+		return
+	}
+
+	// Inline callbacks should always be handled as commands.
+	if strings.HasPrefix(text, "menu:") || strings.HasPrefix(text, "action:") {
+		b.SetSessionState(msg.ChatID, StateIdle, nil)
+		b.handleCommand(msg.ChatID, text)
+		return
+	}
 
 	// Check rate limit
 	if !b.rateLimiter.Allow() {
@@ -25,17 +36,9 @@ func (b *Bot) handleMessage(msg Message) {
 		return
 	}
 
-	// Handle based on current state
-	switch session.State {
-	case StateIdle:
-		b.handleCommand(msg.ChatID, text)
-	case StateWaitingMute:
-		b.handleMuteDuration(msg.ChatID, text)
-	case StateWaitingSwitch:
-		b.handleSwitchAccount(msg.ChatID, text)
-	case StateConfirming:
-		b.handleConfirmation(msg.ChatID, text, session)
-	}
+	// Button-first UX: always guide to menu.
+	b.SetSessionState(msg.ChatID, StateIdle, nil)
+	b.handleMenu(msg.ChatID)
 }
 
 // handleCommand handles commands in idle state
@@ -46,92 +49,97 @@ func (b *Bot) handleCommand(chatID int64, text string) {
 	}
 
 	command := strings.ToLower(parts[0])
-	args := parts[1:]
+
+	if strings.HasPrefix(command, "menu:") {
+		b.handleMenuAction(chatID, command)
+		return
+	}
+	if strings.HasPrefix(command, "action:") {
+		b.handleMenuAction(chatID, command)
+		return
+	}
 
 	switch command {
 	case "/start":
 		b.handleStart(chatID)
-	case "/help":
-		b.handleHelp(chatID)
-	case "/status":
-		b.handleStatus(chatID)
-	case "/quota":
-		b.handleQuota(chatID)
-	case "/alerts":
-		b.handleAlerts(chatID)
-	case "/mute":
-		b.handleMute(chatID, args)
-	case "/force_switch":
-		b.handleForceSwitch(chatID, args)
-	case "/settoken":
-		b.handleSetToken(chatID, args)
-	case "/qg_status":
-		b.biHandleStatus(chatID, args)
-	case "/qg_alerts":
-		b.biHandleAlerts(chatID, args)
-	case "/qg_thresholds":
-		b.biHandleThresholds(chatID, args)
-	case "/qg_policy":
-		b.biHandlePolicy(chatID, args)
-	case "/qg_fallback":
-		b.biHandleFallback(chatID, args)
-	case "/qg_codex_token":
-		b.biHandleCodexToken(chatID, args)
-	case "/qg_codex_status":
-		b.biHandleCodexStatus(chatID, args)
-	case "/qg_antigravity_status":
-		b.biHandleAntigravityStatus(chatID, args)
-	case "/qg_import":
-		b.biHandleImport(chatID, args)
-	case "/qg_export":
-		b.biHandleExport(chatID, args)
-	case "/qg_reload":
-		b.biHandleReload(chatID, args)
+	case "/help", "/menu":
+		b.handleMenu(chatID)
 	default:
-		b.sendErrorMessage(chatID, fmt.Sprintf("Unknown command: %s. Type /help for available commands.", command))
+		// Button-only UX: always guide to menu.
+		b.handleMenu(chatID)
 	}
 }
 
 // handleStart handles the /start command
 func (b *Bot) handleStart(chatID int64) {
-	msg := `🤖 *QuotaGuard Bot*
-
-Welcome! I'm here to help you monitor and manage your QuotaGuard system.
-
-Type /help to see available commands.`
-	b.sendMessage(chatID, msg)
+	msg := "🤖 <b>QuotaGuard</b>\n\n" +
+		"Я помогу мониторить квоты и управлять роутингом.\n\n" +
+		"Выбери действие в меню ниже."
+	b.sendMessageWithKeyboard(chatID, msg, "HTML", mainMenuKeyboard())
 }
 
 // handleHelp handles the /help command
 func (b *Bot) handleHelp(chatID int64) {
-	msg := `📖 *Available Commands*
+	msg := formatHelpMessage()
+	b.sendMessageWithKeyboard(chatID, msg, "HTML", sectionKeyboard(menuHelp))
+}
 
-*System Status*
-/status - Show overall system status
-/quota - Show quota usage for all accounts
-/alerts - Show active alerts
+// handleMenu renders the main menu
+func (b *Bot) handleMenu(chatID int64) {
+	msg := "📌 <b>Главное меню</b>\n\n" +
+		"Статус, квоты, роутинг и настройки — всё тут."
+	b.sendMessageWithKeyboard(chatID, msg, "HTML", mainMenuKeyboard())
+}
 
-*Alert Management*
-/mute [duration] - Mute alerts for specified duration (e.g., /mute 30m, /mute 2h)
-
-*Control*
-/force_switch <account> - Force switch to a specific account
-
-*Setup*
-/settoken <token> - Store bot token in settings
-/qg_codex_token <session_token> - Store Codex session token
-/qg_codex_status - Show Codex auth status
-/qg_antigravity_status - Show Antigravity detection status
-/qg_import - Force import from CLIProxy auths
-
-*General*
-/help - Show this help message
-
-*Examples:*
-/quota - Show all quotas
-/mute 1h - Mute alerts for 1 hour
-/force_switch openai-1 - Switch to openai-1 account`
-	b.sendMessage(chatID, msg)
+func (b *Bot) handleMenuAction(chatID int64, data string) {
+	switch {
+	case data == menuRoot:
+		b.handleMenu(chatID)
+	case data == menuStatus:
+		b.handleStatus(chatID)
+	case data == menuQuota:
+		b.handleQuota(chatID)
+	case data == menuQuick:
+		b.handleQuickActions(chatID)
+	case data == menuAlerts:
+		b.handleAlerts(chatID)
+	case data == menuHelp:
+		b.handleHelp(chatID)
+	case data == menuRouting:
+		b.handleRoutingMenu(chatID)
+	case data == menuFallback:
+		b.handleFallbackMenu(chatID)
+	case data == menuSettings:
+		b.handleSettingsMenu(chatID)
+	case data == menuAccounts:
+		b.handleAccountsMenu(chatID)
+	case data == menuChecks:
+		b.handleAccountChecksMenu(chatID)
+	case data == menuConnect:
+		b.handleConnectAccountsMenu(chatID)
+	case strings.HasPrefix(data, actionThresholds):
+		b.handleThresholdPreset(chatID, data)
+	case strings.HasPrefix(data, actionPolicy):
+		b.handlePolicyPreset(chatID, data)
+	case strings.HasPrefix(data, actionIgnoreEst):
+		b.handleIgnoreEstimated(chatID, data)
+	case strings.HasPrefix(data, actionAcctDisable):
+		b.handleAccountDisable(chatID, data)
+	case strings.HasPrefix(data, actionAcctEnable):
+		b.handleAccountEnable(chatID, data)
+	case strings.HasPrefix(data, actionCheckInt):
+		b.handleAccountCheckInterval(chatID, data)
+	case strings.HasPrefix(data, actionCheckTO):
+		b.handleAccountCheckTimeout(chatID, data)
+	case strings.HasPrefix(data, actionLogin):
+		b.handleAccountLogin(chatID, data)
+	case data == actionReload:
+		b.handleReload(chatID)
+	case data == actionImport:
+		b.handleImport(chatID)
+	default:
+		b.handleMenu(chatID)
+	}
 }
 
 // handleSetToken handles the /settoken command
@@ -179,7 +187,7 @@ func (b *Bot) handleStatus(chatID int64) {
 	}
 
 	msg := formatStatus(status)
-	b.sendMessage(chatID, msg)
+	b.sendMessageWithKeyboard(chatID, msg, "HTML", sectionKeyboard(menuStatus))
 }
 
 // handleQuota handles the /quota command
@@ -196,12 +204,12 @@ func (b *Bot) handleQuota(chatID int64) {
 	}
 
 	if len(quotas) == 0 {
-		b.sendMessage(chatID, "📊 *Quota Status*\n\nNo accounts configured.")
+		b.sendMessageWithKeyboard(chatID, "<b>📊 Quota Status</b>\n\nNo accounts configured.", "HTML", sectionKeyboard(menuQuota))
 		return
 	}
 
 	msg := formatQuotas(quotas)
-	b.sendMessage(chatID, msg)
+	b.sendMessageWithKeyboard(chatID, msg, "HTML", sectionKeyboard(menuQuota))
 }
 
 // handleAlerts handles the /alerts command
@@ -218,7 +226,449 @@ func (b *Bot) handleAlerts(chatID int64) {
 	}
 
 	msg := formatAlerts(alerts)
-	b.sendMessage(chatID, msg)
+	b.sendMessageWithKeyboard(chatID, msg, "HTML", sectionKeyboard(menuAlerts))
+}
+
+func (b *Bot) handleRoutingMenu(chatID int64) {
+	if b.onGetRouterConfig == nil {
+		b.sendErrorMessage(chatID, "Routing config is not available")
+		return
+	}
+	cfg, err := b.onGetRouterConfig()
+	if err != nil || cfg == nil {
+		b.sendErrorMessage(chatID, "Failed to load routing config")
+		return
+	}
+
+	msg := fmt.Sprintf(
+		"🧭 <b>Роутинг</b>\n\n"+
+			"Пороги (использование, %%):\n"+
+			"• Warning: %.0f%%\n"+
+			"• Switch: %.0f%%\n"+
+			"• Critical: %.0f%%\n\n"+
+			"Policy: <code>%s</code>\n"+
+			"Estimated: <b>%s</b>\n\n"+
+			"Логика:\n"+
+			"• переключаем заранее на более безопасный аккаунт\n"+
+			"• если у всех критично — выкачиваем до конца\n\n"+
+			"Рекомендация: <b>Balanced (85/90/95)</b>.",
+		cfg.WarningThreshold,
+		cfg.SwitchThreshold,
+		cfg.CriticalThreshold,
+		html.EscapeString(cfg.DefaultPolicy),
+		boolLabel(cfg.IgnoreEstimated),
+	)
+
+	b.sendMessageWithKeyboard(chatID, msg, "HTML", routingMenuKeyboard())
+}
+
+func (b *Bot) handleFallbackMenu(chatID int64) {
+	if b.onGetRouterConfig == nil {
+		b.sendErrorMessage(chatID, "Fallback config is not available")
+		return
+	}
+	cfg, err := b.onGetRouterConfig()
+	if err != nil || cfg == nil {
+		b.sendErrorMessage(chatID, "Failed to load fallback config")
+		return
+	}
+
+	msg := "🔁 <b>Фоллбэки</b>\n\n"
+	if len(cfg.FallbackChains) == 0 {
+		msg += "Фоллбэки не настроены.\n\n"
+	} else {
+		msg += formatFallbackChains(cfg.FallbackChains)
+		msg += "\n"
+	}
+	msg += "Изменение: через конфиг и кнопки роутинга."
+
+	b.sendMessageWithKeyboard(chatID, msg, "HTML", fallbackMenuKeyboard())
+}
+
+func (b *Bot) handleSettingsMenu(chatID int64) {
+	ignoreEstimated := true
+	if b.onGetRouterConfig != nil {
+		if cfg, err := b.onGetRouterConfig(); err == nil && cfg != nil {
+			ignoreEstimated = cfg.IgnoreEstimated
+		}
+	}
+	msg := "⚙️ <b>Настройки</b>\n\n" +
+		"Estimated аккаунты отображаются, но могут быть выключены для роутинга."
+	b.sendMessageWithKeyboard(chatID, msg, "HTML", settingsMenuKeyboard(ignoreEstimated))
+}
+
+func (b *Bot) handleAccountsMenu(chatID int64) {
+	if b.onGetAccounts == nil {
+		b.sendErrorMessage(chatID, "Accounts callback not configured")
+		return
+	}
+	accounts, err := b.onGetAccounts()
+	if err != nil {
+		b.sendErrorMessage(chatID, fmt.Sprintf("Failed to load accounts: %v", err))
+		return
+	}
+	if len(accounts) == 0 {
+		b.sendMessageWithKeyboard(chatID, "👤 <b>Аккаунты роутинга</b>\n\nНет аккаунтов для управления.", "HTML", sectionKeyboard(menuSettings))
+		return
+	}
+
+	keys := make([]string, 0, len(accounts))
+	var sb strings.Builder
+	sb.WriteString("👤 <b>Аккаунты роутинга</b>\n\n")
+	for i := range accounts {
+		key := b.rememberAccountKey(accounts[i].AccountID, i)
+		keys = append(keys, key)
+		label := displayControlAccountLabel(accounts[i])
+		status := "🟢 active"
+		if !accounts[i].Enabled {
+			status = "⏸ paused"
+		}
+		if accounts[i].IsActive {
+			status += " • 🔥 in use"
+		}
+		sb.WriteString(fmt.Sprintf("• %s\n", label))
+		sb.WriteString(fmt.Sprintf("  %s", status))
+		if accounts[i].DisabledUntil != nil && !accounts[i].Enabled {
+			sb.WriteString(fmt.Sprintf(" • till %s", accounts[i].DisabledUntil.Local().Format("15:04")))
+		}
+		sb.WriteString("\n\n")
+	}
+
+	b.sendMessageWithKeyboard(chatID, sb.String(), "HTML", accountsMenuKeyboard(accounts, keys))
+}
+
+func (b *Bot) handleQuickActions(chatID int64) {
+	msg := "⚡ <b>Быстрые действия</b>\n\n" +
+		"Один тап для самых частых операций."
+	b.sendMessageWithKeyboard(chatID, msg, "HTML", quickActionsKeyboard())
+}
+
+func (b *Bot) handleAccountChecksMenu(chatID int64) {
+	if b.onGetAccountCheckConfig == nil {
+		b.sendErrorMessage(chatID, "Account checks config not available")
+		return
+	}
+	cfg, err := b.onGetAccountCheckConfig()
+	if err != nil || cfg == nil {
+		b.sendErrorMessage(chatID, "Failed to load account checks config")
+		return
+	}
+	msg := fmt.Sprintf(
+		"🩺 <b>Проверка доступности аккаунтов</b>\n\n"+
+			"• Интервал: <code>%s</code>\n"+
+			"• Timeout: <code>%s</code>\n\n"+
+			"Если аккаунт слетел по auth, бот пришлёт критический алерт.\n"+
+			"После ре-логина при восстановлении придёт info-алерт.",
+		cfg.Interval.Truncate(time.Second),
+		cfg.Timeout.Truncate(time.Second),
+	)
+	b.sendMessageWithKeyboard(chatID, msg, "HTML", accountChecksMenuKeyboard())
+}
+
+func (b *Bot) handleAccountCheckInterval(chatID int64, data string) {
+	if b.onSetAccountCheckConfig == nil || b.onGetAccountCheckConfig == nil {
+		b.sendErrorMessage(chatID, "Account checks config not available")
+		return
+	}
+	parts := strings.SplitN(data, ":", 3)
+	if len(parts) != 3 {
+		b.sendErrorMessage(chatID, "Invalid interval action")
+		return
+	}
+	interval, err := time.ParseDuration(parts[2])
+	if err != nil || interval <= 0 {
+		b.sendErrorMessage(chatID, "Invalid interval value")
+		return
+	}
+	current, err := b.onGetAccountCheckConfig()
+	if err != nil || current == nil {
+		b.sendErrorMessage(chatID, "Failed to load current config")
+		return
+	}
+	if err := b.onSetAccountCheckConfig(interval, current.Timeout); err != nil {
+		b.sendErrorMessage(chatID, fmt.Sprintf("Failed to update interval: %v", err))
+		return
+	}
+	b.sendMessageWithParseMode(chatID, "✅ Интервал проверки обновлён.", "HTML")
+	b.handleAccountChecksMenu(chatID)
+}
+
+func (b *Bot) handleAccountCheckTimeout(chatID int64, data string) {
+	if b.onSetAccountCheckConfig == nil || b.onGetAccountCheckConfig == nil {
+		b.sendErrorMessage(chatID, "Account checks config not available")
+		return
+	}
+	parts := strings.SplitN(data, ":", 3)
+	if len(parts) != 3 {
+		b.sendErrorMessage(chatID, "Invalid timeout action")
+		return
+	}
+	timeout, err := time.ParseDuration(parts[2])
+	if err != nil || timeout <= 0 {
+		b.sendErrorMessage(chatID, "Invalid timeout value")
+		return
+	}
+	current, err := b.onGetAccountCheckConfig()
+	if err != nil || current == nil {
+		b.sendErrorMessage(chatID, "Failed to load current config")
+		return
+	}
+	if err := b.onSetAccountCheckConfig(current.Interval, timeout); err != nil {
+		b.sendErrorMessage(chatID, fmt.Sprintf("Failed to update timeout: %v", err))
+		return
+	}
+	b.sendMessageWithParseMode(chatID, "✅ Timeout проверки обновлён.", "HTML")
+	b.handleAccountChecksMenu(chatID)
+}
+
+func (b *Bot) handleConnectAccountsMenu(chatID int64) {
+	msg := "➕ <b>Подключение аккаунтов</b>\n\n" +
+		"1) Нажми провайдера\n" +
+		"2) Перейди по ссылке OAuth\n" +
+		"3) После редиректа отправь в этот чат весь callback URL\n\n" +
+		"После успеха аккаунт сразу попадёт в QuotaGuard."
+	b.sendMessageWithKeyboard(chatID, msg, "HTML", connectAccountsMenuKeyboard())
+}
+
+func (b *Bot) handleAccountLogin(chatID int64, data string) {
+	if b.onBuildLoginURL == nil {
+		b.sendErrorMessage(chatID, "Login flow is not configured")
+		return
+	}
+	parts := strings.SplitN(data, ":", 3)
+	if len(parts) != 3 {
+		b.sendErrorMessage(chatID, "Invalid login action")
+		return
+	}
+	provider := strings.ToLower(strings.TrimSpace(parts[2]))
+	payload, err := b.onBuildLoginURL(provider, chatID)
+	if err != nil {
+		b.sendErrorMessage(chatID, fmt.Sprintf("Failed to start login: %v", err))
+		return
+	}
+	if payload == nil || payload.URL == "" || payload.State == "" {
+		b.sendErrorMessage(chatID, "Login URL is empty")
+		return
+	}
+	b.SetSessionState(chatID, StateWaitingOAuth, map[string]interface{}{
+		"provider": provider,
+		"state":    payload.State,
+	})
+
+	msg := fmt.Sprintf(
+		"🔐 <b>Логин: %s</b>\n\n%s\n\nПосле логина пришли сюда callback URL.",
+		html.EscapeString(provider),
+		html.EscapeString(payload.Instructions),
+	)
+	keyboard := InlineKeyboard{
+		Rows: [][]InlineButton{
+			{
+				{Text: "🌐 Открыть OAuth", URL: payload.URL},
+			},
+			{
+				{Text: "⬅️ Назад", CallbackData: menuConnect},
+			},
+		},
+	}
+	b.sendMessageWithKeyboard(chatID, msg, "HTML", keyboard)
+}
+
+func (b *Bot) handleOAuthCallbackInput(chatID int64, text string, session *UserSession) {
+	if b.onCompleteOAuthLogin == nil {
+		b.sendErrorMessage(chatID, "Login completion callback not configured")
+		b.SetSessionState(chatID, StateIdle, nil)
+		return
+	}
+	provider, _ := session.Data["provider"].(string)
+	expectedState, _ := session.Data["state"].(string)
+	callbackURL := strings.TrimSpace(text)
+	parsed, err := url.Parse(callbackURL)
+	if err != nil || parsed == nil {
+		b.sendErrorMessage(chatID, "Это невалидный callback URL")
+		return
+	}
+	code := parsed.Query().Get("code")
+	state := parsed.Query().Get("state")
+	if code == "" || state == "" {
+		b.sendErrorMessage(chatID, "В URL нет code/state, пришлите полный callback URL")
+		return
+	}
+	if expectedState != "" && state != expectedState {
+		b.sendErrorMessage(chatID, "State не совпадает, начни логин заново")
+		return
+	}
+
+	result, err := b.onCompleteOAuthLogin(provider, state, code, chatID)
+	if err != nil {
+		b.sendErrorMessage(chatID, fmt.Sprintf("Login failed: %v", err))
+		return
+	}
+
+	b.SetSessionState(chatID, StateIdle, nil)
+	if result == nil {
+		b.sendMessageWithParseMode(chatID, "✅ Логин завершён.", "HTML")
+		b.handleConnectAccountsMenu(chatID)
+		return
+	}
+	msg := fmt.Sprintf(
+		"✅ <b>Аккаунт подключён</b>\n\n• Provider: <code>%s</code>\n• Email: <code>%s</code>\n• Account: <code>%s</code>",
+		html.EscapeString(result.Provider),
+		html.EscapeString(result.Email),
+		html.EscapeString(result.AccountID),
+	)
+	b.sendMessageWithKeyboard(chatID, msg, "HTML", connectAccountsMenuKeyboard())
+}
+
+func (b *Bot) handleThresholdPreset(chatID int64, data string) {
+	if b.onUpdateThresholds == nil {
+		b.sendErrorMessage(chatID, "Thresholds callback not configured")
+		return
+	}
+	parts := strings.SplitN(data, ":", 3)
+	if len(parts) != 3 {
+		b.sendErrorMessage(chatID, "Invalid thresholds action")
+		return
+	}
+	values := strings.Split(parts[2], ",")
+	if len(values) != 3 {
+		b.sendErrorMessage(chatID, "Invalid thresholds action")
+		return
+	}
+	warn, err1 := strconv.ParseFloat(values[0], 64)
+	switchVal, err2 := strconv.ParseFloat(values[1], 64)
+	crit, err3 := strconv.ParseFloat(values[2], 64)
+	if err1 != nil || err2 != nil || err3 != nil {
+		b.sendErrorMessage(chatID, "Invalid thresholds values")
+		return
+	}
+	if err := b.onUpdateThresholds(warn, switchVal, crit); err != nil {
+		b.sendErrorMessage(chatID, fmt.Sprintf("Failed to update thresholds: %v", err))
+		return
+	}
+	b.sendMessageWithParseMode(chatID, "✅ Пороги обновлены.", "HTML")
+	b.handleRoutingMenu(chatID)
+}
+
+func (b *Bot) handlePolicyPreset(chatID int64, data string) {
+	if b.onUpdatePolicy == nil {
+		b.sendErrorMessage(chatID, "Policy callback not configured")
+		return
+	}
+	parts := strings.SplitN(data, ":", 3)
+	if len(parts) != 3 || parts[2] == "" {
+		b.sendErrorMessage(chatID, "Invalid policy action")
+		return
+	}
+	policy := parts[2]
+	if err := b.onUpdatePolicy(policy); err != nil {
+		b.sendErrorMessage(chatID, fmt.Sprintf("Failed to update policy: %v", err))
+		return
+	}
+	b.sendMessageWithParseMode(chatID, fmt.Sprintf("✅ Policy set to <code>%s</code>.", html.EscapeString(policy)), "HTML")
+	b.handleRoutingMenu(chatID)
+}
+
+func (b *Bot) handleIgnoreEstimated(chatID int64, data string) {
+	if b.onUpdateIgnoreEstimated == nil {
+		b.sendErrorMessage(chatID, "Settings callback not configured")
+		return
+	}
+	parts := strings.SplitN(data, ":", 3)
+	if len(parts) != 3 {
+		b.sendErrorMessage(chatID, "Invalid settings action")
+		return
+	}
+	value := strings.ToLower(strings.TrimSpace(parts[2]))
+	ignore := value == "on" || value == "true" || value == "1"
+	if err := b.onUpdateIgnoreEstimated(ignore); err != nil {
+		b.sendErrorMessage(chatID, fmt.Sprintf("Failed to update setting: %v", err))
+		return
+	}
+	b.sendMessageWithParseMode(chatID, "✅ Настройка обновлена.", "HTML")
+	b.handleSettingsMenu(chatID)
+}
+
+func (b *Bot) handleReload(chatID int64) {
+	if b.onReloadConfig == nil {
+		b.sendErrorMessage(chatID, "Reload callback not configured")
+		return
+	}
+	if err := b.onReloadConfig(); err != nil {
+		b.sendErrorMessage(chatID, fmt.Sprintf("Failed to reload config: %v", err))
+		return
+	}
+	b.sendMessageWithParseMode(chatID, "✅ Конфиг перезагружен.", "HTML")
+	b.handleSettingsMenu(chatID)
+}
+
+func (b *Bot) handleImport(chatID int64) {
+	if b.onImportAccounts == nil {
+		b.sendErrorMessage(chatID, "Import callback not configured")
+		return
+	}
+
+	newCount, updatedCount, err := b.onImportAccounts("")
+	if err != nil {
+		b.sendErrorMessage(chatID, fmt.Sprintf("Import failed: %v", err))
+		return
+	}
+
+	b.sendMessageWithParseMode(chatID, fmt.Sprintf("✅ Импорт завершён: %d new, %d updated", newCount, updatedCount), "HTML")
+	b.handleQuickActions(chatID)
+}
+
+func (b *Bot) handleAccountDisable(chatID int64, data string) {
+	if b.onToggleAccount == nil {
+		b.sendErrorMessage(chatID, "Account toggle callback not configured")
+		return
+	}
+	parts := strings.Split(data, ":")
+	if len(parts) < 4 {
+		b.sendErrorMessage(chatID, "Invalid disable action")
+		return
+	}
+	key := parts[2]
+	durationToken := parts[3]
+	accountID, ok := b.resolveAccountKey(key)
+	if !ok {
+		b.sendErrorMessage(chatID, "Account key expired, refresh menu")
+		return
+	}
+	duration, err := parseDuration(durationToken)
+	if err != nil {
+		b.sendErrorMessage(chatID, "Invalid disable duration")
+		return
+	}
+	if err := b.onToggleAccount(accountID, duration, false); err != nil {
+		b.sendErrorMessage(chatID, fmt.Sprintf("Failed to disable account: %v", err))
+		return
+	}
+	b.sendMessageWithParseMode(chatID, fmt.Sprintf("⏸ <code>%s</code> paused for %s.", html.EscapeString(accountID), duration.Truncate(time.Minute)), "HTML")
+	b.handleAccountsMenu(chatID)
+}
+
+func (b *Bot) handleAccountEnable(chatID int64, data string) {
+	if b.onToggleAccount == nil {
+		b.sendErrorMessage(chatID, "Account toggle callback not configured")
+		return
+	}
+	parts := strings.Split(data, ":")
+	if len(parts) < 3 {
+		b.sendErrorMessage(chatID, "Invalid enable action")
+		return
+	}
+	key := parts[2]
+	accountID, ok := b.resolveAccountKey(key)
+	if !ok {
+		b.sendErrorMessage(chatID, "Account key expired, refresh menu")
+		return
+	}
+	if err := b.onToggleAccount(accountID, 0, true); err != nil {
+		b.sendErrorMessage(chatID, fmt.Sprintf("Failed to enable account: %v", err))
+		return
+	}
+	b.sendMessageWithParseMode(chatID, fmt.Sprintf("▶️ <code>%s</code> enabled.", html.EscapeString(accountID)), "HTML")
+	b.handleAccountsMenu(chatID)
 }
 
 // handleMute handles the /mute command
@@ -376,7 +826,7 @@ func (b *Bot) handleAlert(alert Alert) {
 	}
 
 	msg := formatAlert(alert)
-	b.sendMessage(b.chatID, msg)
+	b.sendMessageWithParseMode(b.chatID, msg, "HTML")
 }
 
 // sendDailyDigest sends the daily digest message
@@ -452,4 +902,26 @@ func parseDuration(s string) (time.Duration, error) {
 	default:
 		return 0, fmt.Errorf("unknown unit: %s", unit)
 	}
+}
+
+func (b *Bot) rememberAccountKey(accountID string, idx int) string {
+	key := strconv.FormatInt(time.Now().UnixNano(), 36) + strconv.Itoa(idx+1)
+	b.accountKeyMu.Lock()
+	defer b.accountKeyMu.Unlock()
+	b.accountKeys[key] = accountID
+	return key
+}
+
+func (b *Bot) resolveAccountKey(key string) (string, bool) {
+	b.accountKeyMu.RLock()
+	defer b.accountKeyMu.RUnlock()
+	accountID, ok := b.accountKeys[key]
+	return accountID, ok
+}
+
+func displayControlAccountLabel(acc AccountControl) string {
+	if acc.Email == "" {
+		return fmt.Sprintf("<code>%s</code>", html.EscapeString(acc.AccountID))
+	}
+	return fmt.Sprintf("<code>%s</code> %s", html.EscapeString(accountTypeFromID(acc.AccountID)), html.EscapeString(maskEmail(acc.Email)))
 }

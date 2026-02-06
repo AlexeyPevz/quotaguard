@@ -17,6 +17,7 @@ router:
     switch: 90.0
     critical: 95.0
     min_safe: 5.0
+  ignore_estimated: true
 
   anti_flapping:
     min_dwell_time: 5m
@@ -37,7 +38,7 @@ accounts:
   - id: "openai-primary"
     provider: "openai"
     tier: "premium"
-    enabled: true
+    enabled: false
     priority: 100
     concurrency_limit: 100
     input_cost_per_1k: 0.01
@@ -46,7 +47,7 @@ accounts:
   - id: "anthropic-secondary"
     provider: "anthropic"
     tier: "standard"
-    enabled: true
+    enabled: false
     priority: 50
     concurrency_limit: 50
     input_cost_per_1k: 0.015

@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/quotaguard/quotaguard/internal/config"
 	"github.com/quotaguard/quotaguard/internal/router"
@@ -37,6 +38,16 @@ func ensureSettingsDefaults(settings store.SettingsStore, cfg *config.Config) er
 	if cfg.Telegram.ChatID != 0 {
 		setIntIfMissing(settings, store.SettingTelegramChatID, int(cfg.Telegram.ChatID))
 	}
+	setIntIfMissing(
+		settings,
+		store.SettingAccountCheckIntSec,
+		int(envDuration("QUOTAGUARD_ACCOUNT_CHECK_INTERVAL", 3*time.Minute).Seconds()),
+	)
+	setIntIfMissing(
+		settings,
+		store.SettingAccountCheckTOSec,
+		int(envDuration("QUOTAGUARD_ACCOUNT_CHECK_TIMEOUT", 12*time.Second).Seconds()),
+	)
 
 	return nil
 }

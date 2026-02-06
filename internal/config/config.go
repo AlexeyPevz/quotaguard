@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"os"
+	"strings"
 	"time"
 )
 
@@ -103,13 +105,14 @@ type CircuitBreakerConfig struct {
 
 // RouterConfig contains router configuration.
 type RouterConfig struct {
-	Thresholds     ThresholdsConfig     `yaml:"thresholds"`
-	AntiFlapping   AntiFlappingConfig   `yaml:"anti_flapping"`
-	Reservation    ReservationConfig    `yaml:"reservation"`
-	Weights        WeightsConfig        `yaml:"weights"`
-	Policies       []PolicyConfig       `yaml:"policies"`
-	FallbackChains map[string][]string  `yaml:"fallback_chains"`
-	CircuitBreaker CircuitBreakerConfig `yaml:"circuit_breaker"`
+	Thresholds      ThresholdsConfig     `yaml:"thresholds"`
+	AntiFlapping    AntiFlappingConfig   `yaml:"anti_flapping"`
+	Reservation     ReservationConfig    `yaml:"reservation"`
+	Weights         WeightsConfig        `yaml:"weights"`
+	Policies        []PolicyConfig       `yaml:"policies"`
+	FallbackChains  map[string][]string  `yaml:"fallback_chains"`
+	CircuitBreaker  CircuitBreakerConfig `yaml:"circuit_breaker"`
+	IgnoreEstimated bool                 `yaml:"ignore_estimated"`
 }
 
 // ThresholdsConfig contains threshold configuration.
@@ -502,6 +505,14 @@ func (r *RouterConfig) Validate() error {
 	// Cap cost percentages
 	if r.Reservation.DefaultEstimatedCostPercent > 100 {
 		r.Reservation.DefaultEstimatedCostPercent = 100
+	}
+	if raw := strings.TrimSpace(os.Getenv("QUOTAGUARD_IGNORE_ESTIMATED")); raw != "" {
+		switch strings.ToLower(raw) {
+		case "1", "true", "on", "yes":
+			r.IgnoreEstimated = true
+		case "0", "false", "off", "no":
+			r.IgnoreEstimated = false
+		}
 	}
 	return nil
 }

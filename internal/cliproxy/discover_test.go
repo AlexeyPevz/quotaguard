@@ -136,6 +136,24 @@ func TestConvertToAccount(t *testing.T) {
 	}
 }
 
+func TestConvertToCredentialsExpiry(t *testing.T) {
+	auth := AuthFile{
+		Email:      "test@example.com",
+		Type:       "antigravity",
+		Timestamp:  1700000000000,
+		ExpiresIn:  3600,
+		AccessToken: "token",
+		Path:       "/tmp/auth.json",
+	}
+	creds := ConvertToCredentials(auth)
+	require.Equal(t, auth.Timestamp+auth.ExpiresIn*1000, creds.ExpiryDateMs)
+	require.Equal(t, auth.Path, creds.SourcePath)
+
+	auth.Expired = "2026-02-05T12:42:29+03:00"
+	creds = ConvertToCredentials(auth)
+	require.NotZero(t, creds.ExpiryDateMs)
+}
+
 func TestSanitizeAccountID(t *testing.T) {
 	tests := []struct {
 		input string

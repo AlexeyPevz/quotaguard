@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -54,6 +55,9 @@ type Config struct {
 
 	// Circuit Breaker
 	CircuitBreaker config.CircuitBreakerConfig
+
+	// IgnoreEstimated skips accounts with estimated quotas
+	IgnoreEstimated bool
 }
 
 // Weights defines scoring weights
@@ -79,9 +83,9 @@ func DefaultWeights() Weights {
 // DefaultConfig returns default router configuration
 func DefaultConfig() Config {
 	return Config{
-		WarningThreshold:    15.0,
-		SwitchThreshold:     10.0,
-		CriticalThreshold:   5.0,
+		WarningThreshold:    85.0,
+		SwitchThreshold:     90.0,
+		CriticalThreshold:   95.0,
 		MinSafeThreshold:    5.0,
 		MinDwellTime:        5 * time.Minute,
 		CooldownAfterSwitch: 3 * time.Minute,
@@ -99,6 +103,7 @@ func DefaultConfig() Config {
 			Timeout:          30 * time.Second,
 			HalfOpenLimit:    3,
 		},
+		IgnoreEstimated: true,
 	}
 }
 
@@ -156,8 +161,11 @@ func (r *router) shouldSwitch(currentAccountID, newAccountID string, newScore, c
 	currentQuota, hasQuota := r.store.GetQuota(currentAccount)
 
 	// If current account is critical, we SHOULD switch even if dwell time or hysteresis aren't met
-	if hasQuota && currentQuota.IsCritical(r.config.CriticalThreshold) && newScore > 0.2 {
-		return true
+	if hasQuota {
+		usedPercent := usedPercentFromRemaining(currentQuota.EffectiveRemainingWithVirtual())
+		if usedPercent >= r.config.CriticalThreshold && newScore > 0.2 {
+			return true
+		}
 	}
 
 	// Apply hysteresis: only switch if new score is significantly better
@@ -175,6 +183,7 @@ type SelectRequest struct {
 	Exclude          []string          // Account IDs to exclude
 	ExcludeProviders []models.Provider // Providers to exclude
 	EstimatedTokens  int64             // Estimated number of tokens required
+	Model            string            // Optional model id for model-specific fallbacks
 }
 
 // SelectResponse contains the selection result
@@ -212,13 +221,15 @@ func (r *router) Select(ctx context.Context, req SelectRequest) (*SelectResponse
 		return nil, &errors.ErrNoSuitableAccounts{Reason: "no suitable accounts found after filtering"}
 	}
 
+globalLow := r.allAboveThreshold(accounts, r.config.CriticalThreshold)
+
 	// Get weights for the policy
 	weights := r.getWeights(req.Policy)
 
 	// Score all accounts
 	scored := make([]scoredAccount, 0, len(accounts))
 	for _, acc := range accounts {
-		score, reason := r.scoreAccount(acc, weights, req)
+		score, reason := r.scoreAccount(acc, weights, req, globalLow)
 		scored = append(scored, scoredAccount{
 			account: acc,
 			score:   score,
@@ -237,18 +248,38 @@ func (r *router) Select(ctx context.Context, req SelectRequest) (*SelectResponse
 		return nil, &errors.ErrNoSuitableAccounts{Reason: best.reason}
 	}
 
-	// Apply anti-flapping: check if we should switch
 	currentAccount := r.GetCurrentAccount()
 	currentScore := 0.0
+	var currentEntry *scoredAccount
 	if currentAccount != "" {
-		for _, s := range scored {
-			if s.account.ID == currentAccount {
-				currentScore = s.score
+		for i := range scored {
+			if scored[i].account.ID == currentAccount {
+				currentScore = scored[i].score
+				currentEntry = &scored[i]
 				break
 			}
 		}
 	}
 
+	// In global low-quota mode, drain the current account to exhaustion.
+	if globalLow && currentEntry != nil && currentEntry.score > 0 {
+		best = *currentEntry
+		best.reason = fmt.Sprintf("%s; global low quota mode", best.reason)
+	} else if currentEntry != nil {
+		if currentQuota, ok := r.store.GetQuota(currentAccount); ok {
+			usedPercent := usedPercentFromRemaining(currentQuota.EffectiveRemainingWithVirtual())
+			if usedPercent >= r.config.CriticalThreshold {
+				if chain := r.fallbackChainForRequest(currentEntry.account, req); len(chain) > 0 {
+					if fallback := pickFromChain(scored, chain); fallback != nil {
+						best = *fallback
+						best.reason = fmt.Sprintf("%s; fallback chain", best.reason)
+					}
+				}
+			}
+		}
+	}
+
+	// Apply anti-flapping: check if we should switch
 	if !r.shouldSwitch(currentAccount, best.account.ID, best.score, currentScore) {
 		// Stay with current account if we shouldn't switch
 		if currentAccount != "" {
@@ -298,14 +329,18 @@ type scoredAccount struct {
 }
 
 // scoreAccount calculates a score for an account
-func (r *router) scoreAccount(acc *models.Account, weights Weights, req SelectRequest) (float64, string) {
+func (r *router) scoreAccount(acc *models.Account, weights Weights, req SelectRequest, globalLow bool) (float64, string) {
 	quota, ok := r.store.GetQuota(acc.ID)
 	if !ok {
 		return 0, "no quota data"
 	}
+	if r.config.IgnoreEstimated && quota.Source == models.SourceEstimated {
+		return 0, "estimated quota ignored"
+	}
 
 	// Calculate effective remaining with virtual usage
 	effectiveRemaining := quota.EffectiveRemainingWithVirtual()
+	usedPercent := usedPercentFromRemaining(effectiveRemaining)
 
 	// Check if account is exhausted
 	if quota.IsExhausted() || effectiveRemaining <= 0 {
@@ -320,8 +355,12 @@ func (r *router) scoreAccount(acc *models.Account, weights Weights, req SelectRe
 	}
 
 	// Check critical threshold
-	if quota.IsCritical(r.config.CriticalThreshold) {
+	if usedPercent >= r.config.CriticalThreshold {
 		return 0.1, "critical quota level"
+	}
+
+	if !globalLow && usedPercent >= r.config.SwitchThreshold {
+		return 0, "usage above switch threshold"
 	}
 
 	// Check if we have enough for the estimated cost
@@ -432,6 +471,105 @@ func (r *router) getWeights(policy string) Weights {
 	}
 
 	return r.config.Weights
+}
+
+func (r *router) allAboveThreshold(accounts []*models.Account, threshold float64) bool {
+	if len(accounts) == 0 {
+		return false
+	}
+	seen := false
+	for _, acc := range accounts {
+		quota, ok := r.store.GetQuota(acc.ID)
+		if !ok {
+			continue
+		}
+		if r.config.IgnoreEstimated && quota.Source == models.SourceEstimated {
+			continue
+		}
+		seen = true
+		usedPercent := usedPercentFromRemaining(quota.EffectiveRemainingWithVirtual())
+		if usedPercent < threshold {
+			return false
+		}
+	}
+	return seen
+}
+
+func (r *router) fallbackChainForRequest(acc *models.Account, req SelectRequest) []string {
+	if len(r.config.FallbackChains) == 0 {
+		return nil
+	}
+	if req.Model != "" {
+		if chain := getFallbackChain(r.config.FallbackChains, req.Model); len(chain) > 0 {
+			return chain
+		}
+	}
+	return r.fallbackChainForAccount(acc)
+}
+
+func (r *router) fallbackChainForAccount(acc *models.Account) []string {
+	if acc == nil || len(r.config.FallbackChains) == 0 {
+		return nil
+	}
+	if chain, ok := r.config.FallbackChains[acc.ID]; ok {
+		return chain
+	}
+	if acc.ProviderType != "" {
+		if chain, ok := r.config.FallbackChains[acc.ProviderType]; ok {
+			return chain
+		}
+	}
+	if chain, ok := r.config.FallbackChains[string(acc.Provider)]; ok {
+		return chain
+	}
+	return nil
+}
+
+func getFallbackChain(chains map[string][]string, key string) []string {
+	if len(chains) == 0 || key == "" {
+		return nil
+	}
+	if chain, ok := chains[key]; ok {
+		return chain
+	}
+	norm := normalizeModelID(key)
+	if norm != "" && norm != key {
+		if chain, ok := chains[norm]; ok {
+			return chain
+		}
+	}
+	if norm != "" {
+		withPrefix := "models/" + norm
+		if chain, ok := chains[withPrefix]; ok {
+			return chain
+		}
+	}
+	return nil
+}
+
+func normalizeModelID(value string) string {
+	v := strings.TrimSpace(strings.ToLower(value))
+	if v == "" {
+		return v
+	}
+	for strings.HasPrefix(v, "models/") {
+		v = strings.TrimPrefix(v, "models/")
+	}
+	return v
+}
+
+func pickFromChain(scored []scoredAccount, chain []string) *scoredAccount {
+	if len(chain) == 0 {
+		return nil
+	}
+	for _, id := range chain {
+		for i := range scored {
+			if scored[i].account.ID == id && scored[i].score > 0 {
+				return &scored[i]
+			}
+		}
+	}
+	return nil
 }
 
 // GetStats returns router statistics
@@ -615,7 +753,7 @@ func (r *router) GetAccountStatus(accountID string) (*AccountStatus, error) {
 		status.HasQuotaData = true
 		status.EffectiveRemaining = quota.EffectiveRemainingWithVirtual()
 		status.IsExhausted = quota.IsExhausted()
-		status.IsCritical = quota.IsCritical(r.config.CriticalThreshold)
+		status.IsCritical = usedPercentFromRemaining(status.EffectiveRemaining) >= r.config.CriticalThreshold
 		status.VirtualUsed = quota.VirtualUsedPercent
 	}
 
@@ -644,6 +782,7 @@ func (r *router) CalculateOptimalDistribution(ctx context.Context, totalRequests
 
 	distribution := make(map[string]float64)
 	weights := r.config.Weights
+globalLow := r.allAboveThreshold(accounts, r.config.CriticalThreshold)
 
 	// Calculate scores for all accounts
 	type accountScore struct {
@@ -653,7 +792,7 @@ func (r *router) CalculateOptimalDistribution(ctx context.Context, totalRequests
 	scores := make([]accountScore, 0, len(accounts))
 
 	for _, acc := range accounts {
-		score, _ := r.scoreAccount(acc, weights, SelectRequest{})
+		score, _ := r.scoreAccount(acc, weights, SelectRequest{}, globalLow)
 		if score > 0 {
 			scores = append(scores, accountScore{id: acc.ID, score: score})
 		}
@@ -675,6 +814,17 @@ func (r *router) CalculateOptimalDistribution(ctx context.Context, totalRequests
 	}
 
 	return distribution
+}
+
+func usedPercentFromRemaining(remaining float64) float64 {
+	used := 100.0 - remaining
+	if used < 0 {
+		return 0
+	}
+	if used > 100 {
+		return 100
+	}
+	return used
 }
 
 // Circuit Breaker methods

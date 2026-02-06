@@ -186,6 +186,13 @@ func (s *Service) IsRunning() bool {
 	return s.running
 }
 
+// UpdateThresholds replaces the active thresholds for alerting.
+func (s *Service) UpdateThresholds(thresholds []float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.config.Thresholds = thresholds
+}
+
 // CheckThresholds checks thresholds for all accounts
 func (s *Service) CheckThresholds(accounts []models.Account, quotas []models.QuotaInfo) []Alert {
 	if !s.config.Enabled {
@@ -208,10 +215,14 @@ func (s *Service) CheckThresholds(accounts []models.Account, quotas []models.Quo
 			continue
 		}
 
-		// Check each threshold
+		// Check each threshold (thresholds are usage percent)
 		usedPercent := 100.0 - quota.EffectiveRemainingPct
 		var highestExceededThreshold float64
+		var maxThreshold float64
 		for _, threshold := range s.config.Thresholds {
+			if threshold > maxThreshold {
+				maxThreshold = threshold
+			}
 			if usedPercent >= threshold && threshold > highestExceededThreshold {
 				highestExceededThreshold = threshold
 			}
@@ -219,8 +230,26 @@ func (s *Service) CheckThresholds(accounts []models.Account, quotas []models.Quo
 
 		if highestExceededThreshold > 0 {
 			severity := SeverityWarning
-			if usedPercent >= 95.0 {
+			if usedPercent >= maxThreshold {
 				severity = SeverityCritical
+			}
+
+			dimLabel := ""
+			if quota.CriticalDimension != nil {
+				if quota.CriticalDimension.Name != "" {
+					dimLabel = quota.CriticalDimension.Name
+				} else if quota.CriticalDimension.Type != "" {
+					dimLabel = string(quota.CriticalDimension.Type)
+				}
+			}
+			resetAt := nearestResetAt(quota)
+			resetText := ""
+			if resetAt != nil {
+				resetText = fmt.Sprintf(" Next reset: %s", resetAt.Format("2006-01-02 15:04:05"))
+			}
+			dimText := ""
+			if dimLabel != "" {
+				dimText = fmt.Sprintf(" Critical dimension: %s.", dimLabel)
 			}
 
 			alert := Alert{
@@ -228,7 +257,14 @@ func (s *Service) CheckThresholds(accounts []models.Account, quotas []models.Quo
 				AccountID: account.ID,
 				Type:      AlertTypeThreshold,
 				Severity:  severity,
-				Message:   fmt.Sprintf("Quota usage at %.1f%% (threshold: %.1f%%)", usedPercent, highestExceededThreshold),
+				Message: fmt.Sprintf(
+					"Quota remaining %.1f%% (used %.1f%%, threshold: %.1f%%).%s%s",
+					quota.EffectiveRemainingPct,
+					usedPercent,
+					highestExceededThreshold,
+					dimText,
+					resetText,
+				),
 				Threshold: highestExceededThreshold,
 				Current:   usedPercent,
 				Timestamp: time.Now(),
@@ -243,12 +279,17 @@ func (s *Service) CheckThresholds(accounts []models.Account, quotas []models.Quo
 
 		// Check if quota is exhausted
 		if quota.IsExhausted() {
+			resetAt := nearestResetAt(quota)
+			resetText := ""
+			if resetAt != nil {
+				resetText = fmt.Sprintf(" Next reset: %s", resetAt.Format("2006-01-02 15:04:05"))
+			}
 			alert := Alert{
 				ID:        generateAlertID(),
 				AccountID: account.ID,
 				Type:      AlertTypeExhausted,
 				Severity:  SeverityCritical,
-				Message:   "Quota exhausted",
+				Message:   "Quota exhausted." + resetText,
 				Timestamp: time.Now(),
 				Metadata: map[string]interface{}{
 					"provider": string(account.Provider),
@@ -260,6 +301,23 @@ func (s *Service) CheckThresholds(accounts []models.Account, quotas []models.Quo
 	}
 
 	return alerts
+}
+
+func nearestResetAt(quota *models.QuotaInfo) *time.Time {
+	if quota == nil {
+		return nil
+	}
+	var earliest *time.Time
+	for _, dim := range quota.Dimensions {
+		if dim.ResetAt == nil {
+			continue
+		}
+		if earliest == nil || dim.ResetAt.Before(*earliest) {
+			t := *dim.ResetAt
+			earliest = &t
+		}
+	}
+	return earliest
 }
 
 // ProcessAlert processes an alert with deduplication

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -329,6 +330,7 @@ type RouterSelectRequest struct {
 	Policy           string   `json:"policy,omitempty"`
 	Exclude          []string `json:"exclude_accounts,omitempty"`
 	ExcludeProviders []string `json:"exclude_providers,omitempty"`
+	Model            string   `json:"model,omitempty"`
 }
 
 // RouterSelectResponse represents the response from select
@@ -354,6 +356,7 @@ func (s *Server) handleRouterSelect(c *gin.Context) {
 		EstimatedTokens: req.EstimatedTokens,
 		Policy:          req.Policy,
 		Exclude:         req.Exclude,
+		Model:           req.Model,
 	}
 
 	// Convert provider
@@ -383,6 +386,17 @@ func (s *Server) handleRouterSelect(c *gin.Context) {
 
 	// Record the switch
 	s.routerSvc.RecordSwitch(resp.AccountID)
+	selectedAt := time.Now()
+	if acc, ok := s.store.GetAccount(resp.AccountID); ok && acc != nil {
+		group := groupForModel(acc.ProviderType, req.Model)
+		if err := s.store.RecordAccountActivity(resp.AccountID, group, selectedAt); err != nil {
+			s.logger.Warn("failed to record account activity", "account_id", resp.AccountID, "error", err.Error())
+		}
+	} else {
+		if err := s.store.RecordAccountActivity(resp.AccountID, "", selectedAt); err != nil {
+			s.logger.Warn("failed to record account activity", "account_id", resp.AccountID, "error", err.Error())
+		}
+	}
 
 	// Record router decision
 	s.metrics.RecordRouterDecision(req.Policy, "selected", string(resp.Provider))
@@ -394,6 +408,50 @@ func (s *Server) handleRouterSelect(c *gin.Context) {
 		Reason:         resp.Reason,
 		AlternativeIDs: resp.AlternativeIDs,
 	})
+}
+
+func normalizeModelName(model string) string {
+	m := strings.ToLower(strings.TrimSpace(model))
+	m = strings.TrimPrefix(m, "models/")
+	return m
+}
+
+func groupForModel(providerType, model string) string {
+	pt := strings.ToLower(strings.TrimSpace(providerType))
+	m := normalizeModelName(model)
+	if m == "" {
+		return ""
+	}
+
+	if strings.Contains(pt, "antigravity") {
+		switch {
+		case strings.Contains(m, "gemini-3-pro"):
+			return "Gemini 3 Pro (High/Low)"
+		case strings.Contains(m, "gemini-3-flash"):
+			return "Gemini 3 Flash"
+		case strings.Contains(m, "claude-sonnet-4-5"),
+			strings.Contains(m, "claude-opus-4-5"),
+			strings.Contains(m, "gpt-oss-120"):
+			return "Claude 4.5 + Opus 4.5 + GPT OSS 120"
+		}
+	}
+
+	if strings.Contains(pt, "codex") {
+		switch {
+		case strings.Contains(m, "review"):
+			return "Code review primary"
+		case strings.Contains(m, "mini"):
+			return "Codex secondary"
+		default:
+			return "Codex primary"
+		}
+	}
+
+	if strings.Contains(pt, "gemini") {
+		return "Gemini CLI (estimated)"
+	}
+
+	return ""
 }
 
 // RouterFeedbackRequest represents feedback about routing

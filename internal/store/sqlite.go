@@ -194,6 +194,21 @@ func runMigrations(db *sql.DB) error {
 				ALTER TABLE accounts ADD COLUMN oauth_creds_path TEXT DEFAULT '';
 			`,
 		},
+		{
+			version: 6,
+			up: `
+				CREATE TABLE IF NOT EXISTS account_activity (
+					account_id TEXT NOT NULL,
+					group_name TEXT NOT NULL DEFAULT '',
+					last_used_at DATETIME NOT NULL,
+					PRIMARY KEY (account_id, group_name),
+					FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE
+				);
+
+				CREATE INDEX IF NOT EXISTS idx_account_activity_account_id ON account_activity(account_id);
+				CREATE INDEX IF NOT EXISTS idx_account_activity_last_used_at ON account_activity(last_used_at);
+			`,
+		},
 	}
 
 	// Run pending migrations
@@ -664,6 +679,80 @@ func (s *SQLiteStore) ListQuotas() map[string]*models.QuotaInfo {
 	}
 
 	return quotas
+}
+
+// RecordAccountActivity stores exact request usage timestamps for account and group.
+func (s *SQLiteStore) RecordAccountActivity(accountID, group string, usedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, err := s.db.Exec(`
+		INSERT INTO account_activity (account_id, group_name, last_used_at)
+		VALUES (?, ?, ?)
+		ON CONFLICT(account_id, group_name) DO UPDATE SET
+			last_used_at = CASE
+				WHEN excluded.last_used_at > account_activity.last_used_at THEN excluded.last_used_at
+				ELSE account_activity.last_used_at
+			END
+	`, accountID, group, usedAt); err != nil {
+		return &errors.ErrDatabaseQuery{Operation: "record account activity", Err: err}
+	}
+
+	if group != "" {
+		if _, err := s.db.Exec(`
+			INSERT INTO account_activity (account_id, group_name, last_used_at)
+			VALUES (?, '', ?)
+			ON CONFLICT(account_id, group_name) DO UPDATE SET
+				last_used_at = CASE
+					WHEN excluded.last_used_at > account_activity.last_used_at THEN excluded.last_used_at
+					ELSE account_activity.last_used_at
+				END
+		`, accountID, usedAt); err != nil {
+			return &errors.ErrDatabaseQuery{Operation: "record account activity account-level", Err: err}
+		}
+	}
+
+	return nil
+}
+
+// GetAccountActivity returns account and group usage timestamps.
+func (s *SQLiteStore) GetAccountActivity(accountID string) (*models.AccountActivity, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`
+		SELECT group_name, last_used_at
+		FROM account_activity
+		WHERE account_id = ?
+	`, accountID)
+	if err != nil {
+		return nil, false
+	}
+	defer rows.Close()
+
+	activity := &models.AccountActivity{
+		AccountID:    accountID,
+		GroupLastUse: map[string]time.Time{},
+	}
+	found := false
+	for rows.Next() {
+		var group string
+		var usedAt time.Time
+		if err := rows.Scan(&group, &usedAt); err != nil {
+			continue
+		}
+		found = true
+		if group == "" {
+			t := usedAt
+			activity.AccountLastUse = &t
+			continue
+		}
+		activity.GroupLastUse[group] = usedAt
+	}
+	if !found {
+		return nil, false
+	}
+	return activity, true
 }
 
 // Subscribe creates a subscription for quota changes on an account

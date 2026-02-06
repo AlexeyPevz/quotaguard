@@ -154,4 +154,6 @@ const (
 	SettingFallbackChains     = "fallback_chains"
 	SettingAlertsEnabled      = "alerts_enabled"
 	SettingAlertsThreshold    = "alerts_threshold"
+	SettingAccountCheckIntSec = "account_check_interval_sec"
+	SettingAccountCheckTOSec  = "account_check_timeout_sec"
 )

@@ -38,6 +38,7 @@ const (
 
 // Dimension represents a single quota limit dimension.
 type Dimension struct {
+	Name       string          `json:"name,omitempty"`
 	Type       DimensionType   `json:"type"`
 	Limit      int64           `json:"limit"`
 	Used       int64           `json:"used"`

@@ -1,70 +1,92 @@
-# Runbook (RU)
+# Runbook (Beta, RU)
 
-## Запуск в проде
-1. Проверьте `config.yaml`
-2. Установите `QUOTAGUARD_DB_PATH`
-3. Запустите `./quotaguard serve --config config.yaml`
+## 1. Ежедневный operational-check
 
-## Graceful shutdown
-1. Отправьте `SIGTERM`
-2. Сервис завершит HTTP, освободит резервации, сбросит коллектор, закроет БД
+1. Health:
+   - `curl -s http://127.0.0.1:8318/health`
+2. Процесс:
+   - `ps aux | rg quotaguard`
+3. Логи:
+   - `tail -n 200 logs/quotaguard.log` (или ваш stdout файл)
+4. В боте:
+   - `Status` и `Accounts` должны открываться без ошибок.
 
-## Восстановление
-1. Проверьте доступность SQLite файла
-2. Проверьте права на директорию `data/`
+## 2. Стандартный запуск
 
-## Авто‑дискавери
-1. Путь задаётся через `QUOTAGUARD_CLIPROXY_AUTH_PATH`
-2. Дискавери запускается автоматически при старте и по файловым событиям
-3. Команда `./quotaguard setup` нужна только для ручного форс‑импорта
+```bash
+export QUOTAGUARD_DB_PATH=./data/quotaguard.db
+export QUOTAGUARD_CLIPROXY_AUTH_PATH=/opt/cliproxyplus/auths
+export QUOTAGUARD_ANTIGRAVITY_OAUTH_CLIENT_ID=<client_id>
+export QUOTAGUARD_ANTIGRAVITY_OAUTH_CLIENT_SECRET=<client_secret>
+export QUOTAGUARD_GEMINI_OAUTH_CLIENT_ID=<client_id>
+export QUOTAGUARD_GEMINI_OAUTH_CLIENT_SECRET=<client_secret>
+./quotaguard serve --config config.yaml
+```
 
-## Gemini CLI OAuth
-По умолчанию импортируются:
-- `~/.gemini/oauth_creds.json`
-- `~/.config/google-gemini/token.json`
+## 3. Graceful shutdown
 
-Можно переопределить:
-- `GEMINI_OAUTH_PATH=/path/one.json,/path/two.json`
+- Отправьте `SIGTERM`.
+- QuotaGuard корректно завершит HTTP, коллектор и работу с SQLite.
 
-## Qwen CLI OAuth
-По умолчанию:
-- `~/.qwen/oauth_creds.json`
+## 4. Инцидент: аккаунт выпал
 
-Переопределение:
-- `QWEN_OAUTH_PATH=/path/qwen.json`
+Сигналы:
+- Alert в Telegram вида `Account unavailable ... Re-login required`.
+- Рост ошибок по конкретному provider/account.
 
-## Antigravity (local language server)
-Для автоматического сбора квот нужны:
-- `QUOTAGUARD_ANTIGRAVITY_PORT`
-- `QUOTAGUARD_ANTIGRAVITY_CSRF`
+Действия:
+1. Откройте `Connect accounts` в Telegram.
+2. Запустите логин нужного провайдера.
+3. Отправьте callback URL в чат бота.
+4. Проверьте, что аккаунт снова `Enabled` и участвует в роутинге.
 
-QuotaGuard попробует авто‑детект из процесса, но если не найдёт — задайте вручную.
+## 5. Инцидент: Antigravity без групп
 
-Авто‑запуск (best effort):
-- `QUOTAGUARD_ANTIGRAVITY_START_CMD` — команда запуска IDE/языкового сервера
-- `QUOTAGUARD_ANTIGRAVITY_START_TIMEOUT` — сколько ждать появления сервера (по умолчанию `15s`)
+Симптом:
+- По аккаунту есть only overall quota, без 3 групп.
 
-Если `QUOTAGUARD_ANTIGRAVITY_START_CMD` не задана, QuotaGuard попробует стартовать через `antigravity` из `PATH`.
-Если сервер не стартует сам, укажите корректную команду запуска IDE или откройте IDE вручную.
+Пояснение:
+- Группы строятся из фактического ответа API.
+- Если в ответе нет данных по части моделей, полная группировка невозможна.
 
-## Antigravity (Cloud Code OAuth)
-Для прямого облачного запроса нужны:
-- `refresh_token` в SQLite (импортируется через `setup`)
-- OAuth client:
-  - `QUOTAGUARD_GOOGLE_CLIENT_ID`
-  - `QUOTAGUARD_GOOGLE_CLIENT_SECRET` (если требуется)
+Что сделать:
+1. Перелогинить аккаунт через Telegram OAuth flow.
+2. Проверить наличие нужных моделей в реальном model-list этого аккаунта.
+3. Проверить логи коллекторов на 401/403/400.
 
-## Активный коллектор
-- `QUOTAGUARD_COLLECTOR_WORKERS` — количество воркеров (по умолчанию `8`)
-- `QUOTAGUARD_COLLECTOR_JITTER` — jitter между запросами (например `250ms`)
-- `QUOTAGUARD_UTLS=1` — включить uTLS
+## 6. Инцидент: Codex/Gemini не участвует в роутинге
 
-## Codex (ChatGPT)
-Если аккаунт Codex не имеет `session_token` в auth‑файле, можно задать токен через Telegram:
-- `/qg_codex_token <session_token>`
-- Проверка: `/qg_codex_status`
+Проверить:
+- `router.ignore_estimated`.
+- источник квоты (`estimated` или нет).
+- `enabled` флаг аккаунта.
 
-## Типовые команды
-- `./quotaguard setup /path/to/auths`
-- `./quotaguard serve --config config.yaml`
-- `/settoken <token>`
+Рекомендация:
+- В beta держать `ignore_estimated=true`.
+
+## 7. Контроль настройки account checks
+
+Через Telegram:
+- `Settings` -> `Account checks`.
+- Настройте `interval` и `timeout`.
+
+Рекомендуемые значения:
+- interval: `2-5m`
+- timeout: `8-15s`
+
+## 8. Обновление конфигурации без рестарта
+
+Через Telegram:
+- `Settings` -> `Reload`.
+
+## 9. Recovery при проблемах БД
+
+1. Остановить сервис.
+2. Сделать backup `data/quotaguard.db`.
+3. Проверить права на `data/`.
+4. Запустить сервис снова.
+
+## 10. Что не считать инцидентом в beta
+
+- Gemini как estimated при `ignore_estimated=true`.
+- Частичную группировку Antigravity, если API не вернул полные данные.

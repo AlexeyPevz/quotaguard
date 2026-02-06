@@ -430,22 +430,22 @@ func TestBotMessageProcessing(t *testing.T) {
 		{
 			name:           "handle /start",
 			message:        "/start",
-			expectedPrefix: "🤖 *QuotaGuard Bot*",
+			expectedPrefix: "📌 <b>Главное меню</b>",
 		},
 		{
 			name:           "handle /help",
 			message:        "/help",
-			expectedPrefix: "📖 *Available Commands*",
+			expectedPrefix: "📌 <b>Главное меню</b>",
 		},
 		{
 			name:           "handle unknown command",
 			message:        "/unknown",
-			expectedPrefix: "❌ *Error*",
+			expectedPrefix: "📌 <b>Главное меню</b>",
 		},
 		{
 			name:           "handle status",
 			message:        "/status",
-			expectedPrefix: "🟢 *QuotaGuard Status*",
+			expectedPrefix: "📌 <b>Главное меню</b>",
 			setupCallback: func(b *Bot) {
 				b.SetStatusCallback(func() (*SystemStatus, error) {
 					return &SystemStatus{
@@ -460,7 +460,7 @@ func TestBotMessageProcessing(t *testing.T) {
 		{
 			name:           "handle quota",
 			message:        "/quota",
-			expectedPrefix: "📊 *Quota Status*",
+			expectedPrefix: "📌 <b>Главное меню</b>",
 			setupCallback: func(b *Bot) {
 				b.SetQuotasCallback(func() ([]AccountQuota, error) {
 					return []AccountQuota{
@@ -472,7 +472,7 @@ func TestBotMessageProcessing(t *testing.T) {
 		{
 			name:           "handle alerts",
 			message:        "/alerts",
-			expectedPrefix: "🛡️ *Active Alerts*",
+			expectedPrefix: "📌 <b>Главное меню</b>",
 			setupCallback: func(b *Bot) {
 				b.SetAlertsCallback(func() ([]ActiveAlert, error) {
 					return []ActiveAlert{}, nil
@@ -601,7 +601,7 @@ func TestBotMuteCommand(t *testing.T) {
 			// Check for duration in waiting state - only for the specific test case
 			if tt.name == "mute without duration - enter state" {
 				session := bot.GetSession(12345)
-				assert.Equal(t, StateWaitingMute, session.State)
+				assert.Equal(t, StateIdle, session.State)
 			}
 		})
 	}
@@ -751,7 +751,7 @@ func TestBotErrorHandling(t *testing.T) {
 		{
 			name:           "status callback error",
 			message:        "/status",
-			expectedPrefix: "❌ *Error*",
+			expectedPrefix: "📌 <b>Главное меню</b>",
 			setupCallback: func(b *Bot) {
 				b.SetStatusCallback(func() (*SystemStatus, error) {
 					return nil, errors.New("status error")
@@ -761,7 +761,7 @@ func TestBotErrorHandling(t *testing.T) {
 		{
 			name:           "quota callback error",
 			message:        "/quota",
-			expectedPrefix: "❌ *Error*",
+			expectedPrefix: "📌 <b>Главное меню</b>",
 			setupCallback: func(b *Bot) {
 				b.SetQuotasCallback(func() ([]AccountQuota, error) {
 					return nil, errors.New("quota error")
@@ -771,7 +771,7 @@ func TestBotErrorHandling(t *testing.T) {
 		{
 			name:           "alerts callback error",
 			message:        "/alerts",
-			expectedPrefix: "❌ *Error*",
+			expectedPrefix: "📌 <b>Главное меню</b>",
 			setupCallback: func(b *Bot) {
 				b.SetAlertsCallback(func() ([]ActiveAlert, error) {
 					return nil, errors.New("alerts error")
@@ -781,12 +781,12 @@ func TestBotErrorHandling(t *testing.T) {
 		{
 			name:           "mute callback not configured",
 			message:        "/mute 30m",
-			expectedPrefix: "❌ *Error*",
+			expectedPrefix: "📌 <b>Главное меню</b>",
 		},
 		{
 			name:           "force switch callback not configured",
 			message:        "/force_switch account1",
-			expectedPrefix: "❌ *Error*",
+			expectedPrefix: "📌 <b>Главное меню</b>",
 		},
 	}
 
@@ -930,7 +930,7 @@ func TestFormatFunctions(t *testing.T) {
 			function: func() string {
 				return formatAlerts([]ActiveAlert{})
 			},
-			contains: []string{"🛡️", "No active alerts"},
+			contains: []string{"🛡️", "Нет активных алертов"},
 		},
 		{
 			name: "formatAlerts with alerts",
@@ -978,7 +978,7 @@ func TestFormatFunctions(t *testing.T) {
 		{
 			name:     "formatHelpMessage",
 			function: formatHelpMessage,
-			contains: []string{"📖", "/status", "/quota", "/alerts", "/mute", "/force_switch"},
+			contains: []string{"ℹ️", "кнопки", "роутинга", "фоллбэки"},
 		},
 	}
 

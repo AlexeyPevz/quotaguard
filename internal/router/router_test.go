@@ -22,9 +22,9 @@ func TestDefaultWeights(t *testing.T) {
 
 func TestDefaultConfig(t *testing.T) {
 	cfg := DefaultConfig()
-	assert.Equal(t, 15.0, cfg.WarningThreshold)
-	assert.Equal(t, 10.0, cfg.SwitchThreshold)
-	assert.Equal(t, 5.0, cfg.CriticalThreshold)
+	assert.Equal(t, 85.0, cfg.WarningThreshold)
+	assert.Equal(t, 90.0, cfg.SwitchThreshold)
+	assert.Equal(t, 95.0, cfg.CriticalThreshold)
 	assert.Equal(t, 5.0, cfg.MinSafeThreshold)
 	assert.Equal(t, 5*time.Minute, cfg.MinDwellTime)
 	assert.Equal(t, 3*time.Minute, cfg.CooldownAfterSwitch)
@@ -130,6 +130,57 @@ func TestRouter_Select(t *testing.T) {
 		assert.Equal(t, "acc-2", resp.AccountID)
 	})
 
+	t.Run("fallback chain when current account is critical", func(t *testing.T) {
+		s2 := store.NewMemoryStore()
+		accA := &models.Account{ID: "acc-1", Provider: models.ProviderOpenAI, Enabled: true, Priority: 5}
+		accB := &models.Account{ID: "acc-2", Provider: models.ProviderOpenAI, Enabled: true, Priority: 4}
+		accC := &models.Account{ID: "acc-3", Provider: models.ProviderOpenAI, Enabled: true, Priority: 3}
+		s2.SetAccount(accA)
+		s2.SetAccount(accB)
+		s2.SetAccount(accC)
+
+		s2.SetQuota("acc-1", &models.QuotaInfo{AccountID: "acc-1", EffectiveRemainingPct: 2.0})
+		s2.SetQuota("acc-2", &models.QuotaInfo{AccountID: "acc-2", EffectiveRemainingPct: 80.0})
+		s2.SetQuota("acc-3", &models.QuotaInfo{AccountID: "acc-3", EffectiveRemainingPct: 60.0})
+
+		cfg2 := DefaultConfig()
+		cfg2.FallbackChains = map[string][]string{
+			"acc-1": {"acc-3"},
+		}
+		r2 := NewRouter(s2, cfg2).(*router)
+		r2.RecordSwitch("acc-1")
+
+		resp, err := r2.Select(context.Background(), SelectRequest{Provider: models.ProviderOpenAI})
+		require.NoError(t, err)
+		assert.Equal(t, "acc-3", resp.AccountID)
+		assert.Contains(t, resp.Reason, "fallback chain")
+	})
+
+	t.Run("fallback chain with model normalization", func(t *testing.T) {
+		s2 := store.NewMemoryStore()
+		accA := &models.Account{ID: "acc-a", Provider: models.ProviderOpenAI, Enabled: true, Priority: 5}
+		accB := &models.Account{ID: "acc-b", Provider: models.ProviderOpenAI, Enabled: true, Priority: 4}
+		accC := &models.Account{ID: "acc-c", Provider: models.ProviderOpenAI, Enabled: true, Priority: 3}
+		s2.SetAccount(accA)
+		s2.SetAccount(accB)
+		s2.SetAccount(accC)
+		s2.SetQuota("acc-a", &models.QuotaInfo{AccountID: "acc-a", EffectiveRemainingPct: 2.0})
+		s2.SetQuota("acc-b", &models.QuotaInfo{AccountID: "acc-b", EffectiveRemainingPct: 80.0})
+		s2.SetQuota("acc-c", &models.QuotaInfo{AccountID: "acc-c", EffectiveRemainingPct: 60.0})
+
+		cfg2 := DefaultConfig()
+		cfg2.FallbackChains = map[string][]string{
+			"gpt-5.1": {"acc-b"},
+		}
+		r2 := NewRouter(s2, cfg2).(*router)
+		r2.RecordSwitch("acc-a")
+
+		resp, err := r2.Select(context.Background(), SelectRequest{Provider: models.ProviderOpenAI, Model: "models/gpt-5.1"})
+		require.NoError(t, err)
+		assert.Equal(t, "acc-b", resp.AccountID)
+		assert.Contains(t, resp.Reason, "fallback chain")
+	})
+
 	t.Run("no enabled accounts", func(t *testing.T) {
 		emptyStore := store.NewMemoryStore()
 		emptyRouter := NewRouter(emptyStore, cfg)
@@ -138,6 +189,45 @@ func TestRouter_Select(t *testing.T) {
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "no enabled accounts")
 	})
+}
+
+func TestRouter_IgnoresEstimatedQuota(t *testing.T) {
+	s := store.NewMemoryStore()
+	acc := &models.Account{
+		ID:       "acc-est",
+		Provider: models.ProviderOpenAI,
+		Enabled:  true,
+		Priority: 5,
+	}
+	s.SetAccount(acc)
+
+	quota := &models.QuotaInfo{
+		AccountID: "acc-est",
+		Provider:  models.ProviderOpenAI,
+		Source:    models.SourceEstimated,
+		Dimensions: models.DimensionSlice{
+			{
+				Type:       models.DimensionRPD,
+				Limit:      100,
+				Used:       0,
+				Remaining:  100,
+				Semantics:  models.WindowFixed,
+				Source:     models.SourceEstimated,
+				Confidence: 0.2,
+			},
+		},
+		Confidence: 0.2,
+	}
+	quota.UpdateEffective()
+	s.SetQuota("acc-est", quota)
+
+	cfg := DefaultConfig()
+	cfg.IgnoreEstimated = true
+	r := NewRouter(s, cfg).(*router)
+
+	score, reason := r.scoreAccount(acc, cfg.Weights, SelectRequest{}, false)
+	assert.Equal(t, 0.0, score)
+	assert.Equal(t, "estimated quota ignored", reason)
 }
 
 func TestRouter_scoreAccount(t *testing.T) {
@@ -155,7 +245,7 @@ func TestRouter_scoreAccount(t *testing.T) {
 	}
 
 	t.Run("no quota data", func(t *testing.T) {
-		score, reason := routerImpl.scoreAccount(acc, DefaultWeights(), SelectRequest{})
+		score, reason := routerImpl.scoreAccount(acc, DefaultWeights(), SelectRequest{}, false)
 		assert.Equal(t, 0.0, score)
 		assert.Equal(t, "no quota data", reason)
 	})
@@ -169,7 +259,7 @@ func TestRouter_scoreAccount(t *testing.T) {
 		}
 		s.SetQuota("acc-1", quota)
 
-		score, reason := routerImpl.scoreAccount(acc, DefaultWeights(), SelectRequest{})
+		score, reason := routerImpl.scoreAccount(acc, DefaultWeights(), SelectRequest{}, false)
 		assert.Equal(t, 0.0, score)
 		assert.Equal(t, "quota exhausted", reason)
 	})
@@ -184,9 +274,33 @@ func TestRouter_scoreAccount(t *testing.T) {
 		}
 		s.SetQuota("acc-1", quota)
 
-		score, reason := routerImpl.scoreAccount(acc, DefaultWeights(), SelectRequest{})
+		score, reason := routerImpl.scoreAccount(acc, DefaultWeights(), SelectRequest{}, false)
 		assert.Equal(t, 0.1, score)
 		assert.Equal(t, "critical quota level", reason)
+	})
+
+	t.Run("above switch threshold when not global low", func(t *testing.T) {
+		quota := &models.QuotaInfo{
+			AccountID:             "acc-1",
+			EffectiveRemainingPct: 6.0, // Used 94%, above switch threshold (90) but below critical (95)
+		}
+		s.SetQuota("acc-1", quota)
+
+		score, reason := routerImpl.scoreAccount(acc, DefaultWeights(), SelectRequest{}, false)
+		assert.Equal(t, 0.0, score)
+		assert.Equal(t, "usage above switch threshold", reason)
+	})
+
+	t.Run("allow above switch threshold when global low", func(t *testing.T) {
+		quota := &models.QuotaInfo{
+			AccountID:             "acc-1",
+			EffectiveRemainingPct: 6.0,
+		}
+		s.SetQuota("acc-1", quota)
+
+		score, reason := routerImpl.scoreAccount(acc, DefaultWeights(), SelectRequest{}, true)
+		assert.Greater(t, score, 0.0)
+		assert.Contains(t, reason, "safety=")
 	})
 
 	t.Run("normal scoring", func(t *testing.T) {
@@ -211,7 +325,7 @@ func TestRouter_scoreAccount(t *testing.T) {
 		}
 		s2.SetQuota("acc-1", quota)
 
-		score, reason := routerImpl2.scoreAccount(acc2, DefaultWeights(), SelectRequest{})
+		score, reason := routerImpl2.scoreAccount(acc2, DefaultWeights(), SelectRequest{}, false)
 		assert.Greater(t, score, 0.0)
 		assert.Contains(t, reason, "safety=")
 	})
@@ -242,7 +356,7 @@ func TestRouter_scoreAccount(t *testing.T) {
 		req := SelectRequest{
 			EstimatedCost: 50.0, // Requesting 50%, but only 50% remaining and MinSafeThreshold is 5%
 		}
-		score, reason := routerImpl2.scoreAccount(acc2, DefaultWeights(), req)
+		score, reason := routerImpl2.scoreAccount(acc2, DefaultWeights(), req, false)
 		assert.Equal(t, 0.2, score)
 		assert.Equal(t, "insufficient quota for estimated cost", reason)
 	})
@@ -273,7 +387,7 @@ func TestRouter_scoreAccount(t *testing.T) {
 		req := SelectRequest{
 			RequiredDims: []models.DimensionType{models.DimensionTPM},
 		}
-		score, reason := routerImpl2.scoreAccount(acc2, DefaultWeights(), req)
+		score, reason := routerImpl2.scoreAccount(acc2, DefaultWeights(), req, false)
 		assert.Equal(t, 0.0, score)
 		assert.Contains(t, reason, "missing required dimension")
 	})

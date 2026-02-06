@@ -1,53 +1,103 @@
-# Telegram Integration (RU)
+# Telegram Integration (Beta, RU)
 
-Этот документ описывает два сценария работы Telegram‑интерфейса QuotaGuard.
+## 1. Режимы работы
 
-## Вариант A — отдельный бот QuotaGuard
-Подходит большинству пользователей.
+### Режим A: standalone QuotaGuard bot (рекомендуется)
 
-1. Создайте бота через BotFather и получите токен.
-2. В `config.yaml` включите:
-   - `telegram.enabled: true`
-3. Запустите QuotaGuard.
-4. Напишите **этому боту**:
-   - `/settoken <TOKEN>`
+Используется полный UX:
+- кнопочные меню,
+- inline actions,
+- управление аккаунтами,
+- login flow через кнопки.
 
-После этого QuotaGuard сохранит `token` и `chat_id` в SQLite и начнёт отвечать на команды `/qg_*`.
+### Режим B: интеграция в существующий бот
 
-## Вариант B — интеграция с вашим существующим ботом
-Если у вас уже есть управляющий бот и вы не хотите второго.
+Используется `BotIntegrator`.
 
-1. Используйте `BotIntegrator` из `internal/telegram/integration.go`.
-2. Передавайте updates QuotaGuard‑интегратору.
-3. В чате бота выполните:
-   - `/settoken <TOKEN>`
+Важно для beta:
+- команды `/qg_*` работают,
+- `/settoken` работает,
+- полный callback UX ограничен реализацией вашего update-loop и текущим интегратором.
 
-Пример (Go):
+## 2. Standalone setup
+
+В `config.yaml`:
+- `telegram.enabled: true`
+- `telegram.bot_token: <BOT_TOKEN>`
+
+В ENV для Telegram-driven OAuth:
+- `QUOTAGUARD_ANTIGRAVITY_OAUTH_CLIENT_ID`
+- `QUOTAGUARD_ANTIGRAVITY_OAUTH_CLIENT_SECRET`
+- `QUOTAGUARD_GEMINI_OAUTH_CLIENT_ID`
+- `QUOTAGUARD_GEMINI_OAUTH_CLIENT_SECRET`
+
+Запуск:
+
+```bash
+./quotaguard serve --config config.yaml
+```
+
+В чате:
+- `/start`
+
+## 3. Основные экранные разделы (standalone)
+
+- `Status` — сводка здоровья, квоты, активные аккаунты.
+- `Routing` — policy/thresholds/fallback/ignore_estimated.
+- `Accounts` — список routable аккаунтов, enable/disable.
+- `Settings` — reload/import/export/account checks.
+- `Connect accounts` — OAuth login поток в Telegram.
+
+## 4. OAuth login прямо из Telegram
+
+Поток:
+1. Выбрать provider в `Connect accounts`.
+2. Нажать кнопку открытия OAuth URL.
+3. После редиректа отправить полный callback URL в чат.
+4. Бот завершит exchange и создаст/обновит account+credentials.
+
+Поддерживаемые провайдеры для этого потока:
+- `antigravity`
+- `gemini`
+
+## 5. Интеграция в существующий бот (командный режим)
+
+Пример:
+
 ```go
-tgClient, _ := tgbotapi.NewBotAPI(os.Getenv("USER_BOT_TOKEN"))
-
-qgBot := telegram.NewBot(os.Getenv("QG_BOT_TOKEN"), 0, true, &telegram.BotOptions{
-    BotAPI:   nil, // ваш polling
-    Settings: settingsStore,
-})
+updates := tgClient.GetUpdatesChan(tgbotapi.NewUpdate(0))
 qgIntegrator := telegram.NewBotIntegrator(qgBot)
 
-updates := tgClient.GetUpdatesChan(tgbotapi.NewUpdate(0))
 for update := range updates {
-    // ваши хендлеры
+    // ваши обработчики
     qgIntegrator.HandleUpdate(update)
 }
 ```
 
-## Команды
-- `/qg_status` — статус системы.
-- `/qg_fallback` — fallback chains (JSON).
-- `/qg_thresholds` — пороги.
-- `/qg_policy` — политика маршрутизации.
-- `/qg_codex_token <session_token>` — сохранить Codex session token в SQLite.
-- `/qg_codex_status` — проверить, задан ли Codex session token.
-- `/qg_antigravity_status` — статус авто‑детекта Antigravity.
-- `/qg_import` — форс‑импорт аккаунтов из CLIProxy.
-- `/qg_export` — экспорт `config.yaml`.
-- `/qg_reload` — перезагрузка конфигурации.
-- `/settoken <token>` — сохранить токен и chat_id.
+Команды:
+- `/qg_status`
+- `/qg_thresholds`
+- `/qg_policy`
+- `/qg_fallback`
+- `/qg_alerts`
+- `/qg_import`
+- `/qg_export`
+- `/qg_reload`
+- `/qg_codex_token`
+- `/qg_codex_status`
+- `/qg_antigravity_status`
+- `/settoken`
+
+## 6. UX и форматирование
+
+В standalone-боте:
+- провайдеры и аккаунты сгруппированы,
+- прогресс-бары вынесены под заголовок аккаунта,
+- цвета и текстовые статусы показывают warning/critical,
+- для аккаунтов показываются time-to-reset, last-call, active marker (если есть данные).
+
+## 7. Безопасность
+
+- Не отправляйте long-lived токены в публичные чаты.
+- Используйте приватный админ-чат.
+- Ограничьте доступ к вашему боту только доверенным пользователям.

@@ -1,105 +1,127 @@
-# QuotaGuard
+# QuotaGuard (Beta)
 
-QuotaGuard — сервис маршрутизации запросов между провайдерами LLM с учётом квот, анти‑флаппинга и резервирований. Поддерживает автоматическое обнаружение аккаунтов CLIProxyAPI и управление через Telegram.
+QuotaGuard — маршрутизатор LLM-запросов по квотам с авто-импортом аккаунтов из CLIProxy и управлением через Telegram.
 
-## Возможности
-- Авто‑дискавери аккаунтов из CLIProxyAPI auths.
-- Маршрутизация по политикам и порогам, анти‑флаппинг.
-- Резервирования и учёт виртуального расхода.
-- Управление через Telegram и интеграция с существующими ботами.
-- Хранение динамических настроек в SQLite.
-- Graceful shutdown.
+## Статус Beta
 
-## Быстрый старт
-1. `make build`
-2. `./quotaguard serve --config config.yaml`
-3. В Telegram: `/settoken <bot_token>`
+Текущий релиз — `beta`.
 
-## CLI
-- `quotaguard serve --config config.yaml` — запуск сервера.
-- `quotaguard setup [auths_path]` — разовый импорт аккаунтов (обычно не нужен).
-- `quotaguard quotas` — просмотр квот.
-- `quotaguard check` — быстрый чек.
+Готово и работает:
+- Авто-дискавери аккаунтов из CLIProxy auths.
+- Сбор квот `codex`, `antigravity`, `gemini` (gemini в режиме estimated).
+- Роутинг с порогами, fallback-цепочками, анти-флаппингом.
+- Исключение `estimated` аккаунтов из роутинга (`router.ignore_estimated: true`).
+- Telegram UX для standalone-бота: меню, кнопки, действия по аккаунтам.
 
-## Telegram: два режима
+Ограничения beta:
+- `gemini` сейчас показывается как estimated и не участвует в роутинге при `ignore_estimated=true`.
+- Разбиение Antigravity на группы зависит от фактического ответа облака для конкретного аккаунта.
+- Интеграция в существующий бот поддерживает команды `qg_*`; полный callback-UI доступен в standalone-режиме.
 
-### Вариант A — отдельный бот QuotaGuard (проще)
-1. Создайте бота через BotFather и получите токен.
-2. В `config.yaml` включите:
-   - `telegram.enabled: true`
-3. Запустите QuotaGuard.
-4. Напишите **этому боту** в любом чате:
-   - `/settoken <TOKEN>`
+## Архитектура
 
-QuotaGuard сохранит `token` и `chat_id` в SQLite и начнёт отвечать на команды.
+- `internal/collector` — активный сбор квот.
+- `internal/router` — выбор аккаунта и fallback.
+- `internal/cliproxy` — обнаружение/импорт auth-файлов.
+- `internal/store` — SQLite, динамические настройки.
+- `internal/telegram` — standalone-бот и интеграция в чужой бот.
 
-### Вариант B — ваш существующий бот (интеграция)
-Если у вас уже есть управляющий бот и вы не хотите второго:
-1. Получите токен этого бота.
-2. В вашем коде добавьте обработчик `HandleUpdate`:
-   ```go
-   tgClient, _ := tgbotapi.NewBotAPI(os.Getenv("USER_BOT_TOKEN"))
-   qgBot := telegram.NewBot(os.Getenv("QG_BOT_TOKEN"), 0, true, &telegram.BotOptions{
-       BotAPI:   nil, // используете свой polling
-       Settings: settingsStore,
-   })
-   qgIntegrator := telegram.NewBotIntegrator(qgBot)
+## Установка
 
-   updates := tgClient.GetUpdatesChan(tgbotapi.NewUpdate(0))
-   for update := range updates {
-       // ваши хендлеры
-       qgIntegrator.HandleUpdate(update)
-   }
-   ```
-3. В чате этого бота выполните:
-   - `/settoken <TOKEN>`
+```bash
+make build
+./quotaguard serve --config config.yaml
+```
 
-### Команды
-- `/qg_status` — статус системы.
-- `/qg_fallback` — текущие fallback chains и обновление через JSON.
-- `/qg_thresholds` — чтение/обновление порогов.
-- `/qg_policy` — чтение/обновление политики.
-- `/qg_codex_token <session_token>` — сохранить Codex session token.
-- `/qg_codex_status` — проверить Codex auth.
-- `/qg_antigravity_status` — статус авто‑детекта Antigravity.
-- `/qg_import` — форс‑импорт аккаунтов из CLIProxy.
-- `/qg_export` — экспорт `config.yaml`.
-- `/qg_reload` — перезагрузка конфигурации.
-- `/settoken <token>` — сохранить токен и chat_id в SQLite.
+Минимальные ENV:
+- `QUOTAGUARD_DB_PATH` (например `./data/quotaguard.db`)
+- `QUOTAGUARD_CLIPROXY_AUTH_PATH` (обычно `/opt/cliproxyplus/auths`)
+
+## Первый запуск
+
+1. Запустите сервис:
+   - `./quotaguard serve --config config.yaml`
+2. Проверьте health:
+   - `curl -s http://127.0.0.1:8318/health`
+3. В Telegram откройте бота и выполните `/start`.
+4. Нажмите `Обновить` в меню Accounts/Status, убедитесь, что аккаунты импортированы.
+
+## Telegram режимы
+
+### Режим A: standalone-бот (рекомендуется)
+
+В `config.yaml`:
+- `telegram.enabled: true`
+- `telegram.bot_token: <BOT_TOKEN>`
+
+Что доступно:
+- Кнопочное меню (status/routing/settings/accounts/login).
+- Временное отключение аккаунтов от роутинга.
+- Настройка порогов/политики/fallback.
+- Логин новых аккаунтов через OAuth URL + callback в чат.
+
+### Режим B: встраивание в существующий бот
+
+Используйте `BotIntegrator` из `internal/telegram/integration.go`.
+
+Важно:
+- Поддерживаются команды `/qg_*` и `/settoken`.
+- Full inline callback UX (кнопки) в интеграторе сейчас ограничен.
+
+## /quota и отображение
+
+В `/quota` попадают только аккаунты, у которых:
+- `provider_type != ""`
+- `credentials_ref != ""`
+- `enabled = true`
+
+`config-only` аккаунты (пример: `openai-primary`) скрыты.
+
+## Роутинг
+
+Ключевые параметры `router` в `config.yaml`:
+- `thresholds.warning`
+- `thresholds.switch`
+- `thresholds.critical`
+- `fallback_chains`
+- `ignore_estimated` (рекомендуется `true`)
+
+Логика:
+- до критики переключаем заранее на более безопасный аккаунт,
+- если все близко к исчерпанию, дожимаем доступные,
+- при проблемах аккаунтов уходит alert в Telegram.
 
 ## Переменные окружения
-- `QUOTAGUARD_CONFIG_PATH` — путь к `config.yaml`.
-- `QUOTAGUARD_DB_PATH` — путь к SQLite БД.
-- `QUOTAGUARD_CLIPROXY_AUTH_PATH` — путь к папке auths (импорт идёт автоматически при старте).
-- `GEMINI_OAUTH_PATH` — путь(и) к OAuth файлам Gemini CLI (через запятую).
-- `QWEN_OAUTH_PATH` — путь(и) к OAuth файлам Qwen CLI (через запятую).
-- `QUOTAGUARD_ANTIGRAVITY_PORT` — порт Antigravity сервера.
-- `QUOTAGUARD_ANTIGRAVITY_CSRF` — CSRF токен Antigravity.
-- `QUOTAGUARD_ANTIGRAVITY_START_CMD` — команда авто‑запуска IDE/сервера.
-- `QUOTAGUARD_ANTIGRAVITY_START_TIMEOUT` — сколько ждать запуска (по умолчанию `15s`).
-- Если `QUOTAGUARD_ANTIGRAVITY_START_CMD` не задана, QuotaGuard попробует запустить `antigravity` из `PATH`.
-- `QUOTAGUARD_GOOGLE_CLIENT_ID` / `QUOTAGUARD_GOOGLE_CLIENT_SECRET` — OAuth client для Antigravity (refresh_token).
-- `QUOTAGUARD_UTLS=1` — включить uTLS (имитация браузерного TLS отпечатка).
-- `QUOTAGUARD_COLLECTOR_WORKERS` — воркеры активного коллектора (по умолчанию `8`).
-- `QUOTAGUARD_COLLECTOR_JITTER` — jitter между запросами (например `250ms`).
-- `SHUTDOWN_TIMEOUT` — таймаут graceful shutdown.
 
-## Docker
-1. `docker compose -f docker-compose.yml up -d`
-2. Отредактировать `config.yaml` и передать токен через `/settoken`
+- `QUOTAGUARD_CONFIG_PATH`
+- `QUOTAGUARD_DB_PATH`
+- `QUOTAGUARD_CLIPROXY_AUTH_PATH`
+- `QUOTAGUARD_IGNORE_ESTIMATED`
+- `QUOTAGUARD_COLLECTOR_WORKERS`
+- `QUOTAGUARD_COLLECTOR_JITTER`
+- `QUOTAGUARD_UTLS=1`
+- `QUOTAGUARD_ACCOUNT_CHECK_INTERVAL`
+- `QUOTAGUARD_ACCOUNT_CHECK_TIMEOUT`
+- `QUOTAGUARD_GOOGLE_CLIENT_ID`
+- `QUOTAGUARD_GOOGLE_CLIENT_SECRET`
+- `QUOTAGUARD_GOOGLE_CLIENT_SECRET_CANDIDATES` (через запятую, опционально)
+- `QUOTAGUARD_ANTIGRAVITY_OAUTH_CLIENT_ID`
+- `QUOTAGUARD_ANTIGRAVITY_OAUTH_CLIENT_SECRET`
+- `QUOTAGUARD_GEMINI_OAUTH_CLIENT_ID`
+- `QUOTAGUARD_GEMINI_OAUTH_CLIENT_SECRET`
+- `GEMINI_OAUTH_PATH`
+- `QWEN_OAUTH_PATH`
 
-## Структура репозитория
-- `cmd/quotaguard` — CLI.
-- `internal/api` — HTTP API.
-- `internal/router` — маршрутизация.
-- `internal/collector` — сбор квот.
-- `internal/telegram` — Telegram бот и интеграция.
-- `internal/cliproxy` — авто‑дискавери аккаунтов.
-- `internal/store` — SQLite + settings.
+## Команды CLI
+
+- `./quotaguard serve --config config.yaml`
+- `./quotaguard setup /path/to/auths`
+- `./quotaguard quotas`
+- `./quotaguard check`
 
 ## Документация
-- `QUICKSTART.md`
-- `RUNBOOK.md`
-- `.github/workflows/ci.yml` — CI для Go
-- `TELEGRAM.md` — сценарии интеграции Telegram
-- `AGENTS.md` — агентная установка
+
+- `QUICKSTART.md` — быстрый путь для людей.
+- `RUNBOOK.md` — эксплуатация/инциденты.
+- `TELEGRAM.md` — UX и интеграция Telegram.
+- `AGENTS.md` — установка и проверка для агентов.

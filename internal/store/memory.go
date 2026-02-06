@@ -15,6 +15,7 @@ type MemoryStore struct {
 	accounts     map[string]*models.Account   // key: accountID
 	credentials  map[string]*models.AccountCredentials
 	reservations map[string]*models.Reservation // key: reservationID
+	activities   map[string]*models.AccountActivity
 	settings     SettingsStore
 
 	// Subscribers for quota changes
@@ -29,6 +30,7 @@ func NewMemoryStore() *MemoryStore {
 		accounts:     make(map[string]*models.Account),
 		credentials:  make(map[string]*models.AccountCredentials),
 		reservations: make(map[string]*models.Reservation),
+		activities:   make(map[string]*models.AccountActivity),
 		subscribers:  make(map[string][]chan models.QuotaEvent),
 		settings:     NewMemorySettingsStore(),
 	}
@@ -203,6 +205,54 @@ func (s *MemoryStore) ListQuotas() map[string]*models.QuotaInfo {
 	return result
 }
 
+// RecordAccountActivity stores exact request usage timestamps for account and group.
+func (s *MemoryStore) RecordAccountActivity(accountID, group string, usedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	act, ok := s.activities[accountID]
+	if !ok || act == nil {
+		act = &models.AccountActivity{
+			AccountID:    accountID,
+			GroupLastUse: make(map[string]time.Time),
+		}
+		s.activities[accountID] = act
+	}
+	if act.AccountLastUse == nil || usedAt.After(*act.AccountLastUse) {
+		t := usedAt
+		act.AccountLastUse = &t
+	}
+	if group != "" {
+		if prev, exists := act.GroupLastUse[group]; !exists || usedAt.After(prev) {
+			act.GroupLastUse[group] = usedAt
+		}
+	}
+	return nil
+}
+
+// GetAccountActivity returns activity for one account.
+func (s *MemoryStore) GetAccountActivity(accountID string) (*models.AccountActivity, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	act, ok := s.activities[accountID]
+	if !ok || act == nil {
+		return nil, false
+	}
+	copyAct := &models.AccountActivity{
+		AccountID:    act.AccountID,
+		GroupLastUse: make(map[string]time.Time, len(act.GroupLastUse)),
+	}
+	if act.AccountLastUse != nil {
+		t := *act.AccountLastUse
+		copyAct.AccountLastUse = &t
+	}
+	for k, v := range act.GroupLastUse {
+		copyAct.GroupLastUse[k] = v
+	}
+	return copyAct, true
+}
+
 // Subscribe creates a subscription for quota changes on an account
 func (s *MemoryStore) Subscribe(accountID string) chan models.QuotaEvent {
 	s.subMu.Lock()
@@ -314,6 +364,7 @@ func (s *MemoryStore) Clear() {
 	s.quotas = make(map[string]*models.QuotaInfo)
 	s.accounts = make(map[string]*models.Account)
 	s.reservations = make(map[string]*models.Reservation)
+	s.activities = make(map[string]*models.AccountActivity)
 	if settings, ok := s.settings.(*MemorySettingsStore); ok {
 		settings.Clear()
 	}
@@ -372,6 +423,8 @@ type Store interface {
 	UpdateQuota(accountID string, quota *models.QuotaInfo) error
 	DeleteQuota(accountID string) bool
 	ListQuotas() map[string]*models.QuotaInfo
+	RecordAccountActivity(accountID, group string, usedAt time.Time) error
+	GetAccountActivity(accountID string) (*models.AccountActivity, bool)
 
 	// Reservation operations
 	GetReservation(id string) (*models.Reservation, bool)

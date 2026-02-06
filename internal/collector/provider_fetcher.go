@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -80,18 +81,28 @@ type codexSessionResponse struct {
 
 func (pf *ProviderFetcher) fetchOpenAI(ctx context.Context, acc *models.Account, creds *models.AccountCredentials) (*models.QuotaInfo, error) {
 	sessionToken := strings.TrimSpace(creds.SessionToken)
-	if sessionToken == "" {
-		return nil, fmt.Errorf("missing session_token")
-	}
+	jwt := strings.TrimSpace(creds.AccessToken)
+	accountID := strings.TrimSpace(creds.ProviderAccountID)
 
-	jwt, accountID, err := pf.codexJWT(ctx, sessionToken)
-	if err != nil {
-		return nil, err
+	if sessionToken != "" {
+		var err error
+		jwt, accountID, err = pf.codexJWT(ctx, sessionToken)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		if jwt == "" || accountID == "" {
+			return nil, fmt.Errorf("missing session_token or access_token/account_id")
+		}
 	}
 
 	usage, headers, err := pf.codexUsage(ctx, jwt, accountID)
 	if err != nil {
 		return nil, err
+	}
+
+	if quota, ok := codexQuotaFromRateLimit(acc, usage); ok {
+		return quota, nil
 	}
 
 	limit, used := parseCodexUsage(usage)
@@ -167,6 +178,60 @@ func (pf *ProviderFetcher) codexUsage(ctx context.Context, jwtToken, accountID s
 		return nil, resp.Header, err
 	}
 	return parsed, resp.Header, nil
+}
+
+func codexQuotaFromRateLimit(acc *models.Account, usage map[string]interface{}) (*models.QuotaInfo, bool) {
+	rateLimit, ok := usage["rate_limit"].(map[string]interface{})
+	if !ok {
+		return nil, false
+	}
+
+	dims := make(models.DimensionSlice, 0, 3)
+	addWindow := func(name string, window any) {
+		m, ok := window.(map[string]interface{})
+		if !ok {
+			return
+		}
+		if _, ok := m["used_percent"]; !ok {
+			return
+		}
+		usedPct := readFloat(m["used_percent"])
+		limit := int64(100)
+		used := int64(usedPct + 0.5)
+		resetAt := parseUnixTimePtr(m["reset_at"])
+		dims = append(dims, models.Dimension{
+			Name:       name,
+			Type:       models.DimensionType("WINDOW"),
+			Limit:      limit,
+			Used:       used,
+			Remaining:  maxInt64(0, limit-used),
+			ResetAt:    resetAt,
+			Semantics:  models.WindowFixed,
+			Source:     models.SourcePolling,
+			Confidence: 0.6,
+		})
+	}
+
+	addWindow("Codex primary", rateLimit["primary_window"])
+	addWindow("Codex secondary", rateLimit["secondary_window"])
+
+	if review, ok := usage["code_review_rate_limit"].(map[string]interface{}); ok {
+		addWindow("Code review primary", review["primary_window"])
+	}
+
+	if len(dims) == 0 {
+		return nil, false
+	}
+
+	quota := models.NewQuotaInfo()
+	quota.Provider = acc.Provider
+	quota.AccountID = acc.ID
+	quota.Tier = acc.Tier
+	quota.Source = models.SourcePolling
+	quota.Confidence = 0.6
+	quota.Dimensions = dims
+	quota.UpdateEffective()
+	return quota, true
 }
 
 func parseCodexUsage(payload map[string]interface{}) (limit int, used int) {
@@ -255,47 +320,112 @@ func (pf *ProviderFetcher) fetchAntigravity(ctx context.Context, acc *models.Acc
 	clientID := strings.TrimSpace(creds.ClientID)
 	clientSecret := strings.TrimSpace(creds.ClientSecret)
 	if clientID == "" {
-		clientID = strings.TrimSpace(os.Getenv("QUOTAGUARD_GOOGLE_CLIENT_ID"))
+		clientID = firstNonEmpty(
+			strings.TrimSpace(os.Getenv("QUOTAGUARD_ANTIGRAVITY_OAUTH_CLIENT_ID")),
+			strings.TrimSpace(os.Getenv("QUOTAGUARD_GOOGLE_CLIENT_ID")),
+		)
 	}
 	if clientSecret == "" {
-		clientSecret = strings.TrimSpace(os.Getenv("QUOTAGUARD_GOOGLE_CLIENT_SECRET"))
+		clientSecret = firstNonEmpty(
+			strings.TrimSpace(os.Getenv("QUOTAGUARD_ANTIGRAVITY_OAUTH_CLIENT_SECRET")),
+			strings.TrimSpace(os.Getenv("QUOTAGUARD_GOOGLE_CLIENT_SECRET")),
+		)
 	}
 	if clientID == "" {
 		return nil, fmt.Errorf("missing Google OAuth client_id")
 	}
+	creds.ClientID = clientID
+	creds.ClientSecret = clientSecret
+	if creds.TokenURI == "" {
+		creds.TokenURI = "https://oauth2.googleapis.com/token"
+	}
 
-	accessToken, err := pf.refreshGoogleAccessToken(ctx, clientID, clientSecret, refreshToken)
+	secrets := antigravityCandidateSecrets(clientSecret)
+	var accessToken string
+	var lastErr error
+	for _, secret := range secrets {
+		creds.ClientSecret = secret
+		token, err := pf.ensureOAuthToken(ctx, acc.ID, creds, "https://oauth2.googleapis.com/token")
+		if err == nil {
+			accessToken = token
+			break
+		}
+		lastErr = err
+	}
+	if accessToken == "" {
+		return nil, fmt.Errorf("antigravity oauth: %w", lastErr)
+	}
+
+	projectID := strings.TrimSpace(creds.ProjectID)
+	if strings.Contains(projectID, ",") {
+		for _, p := range strings.Split(projectID, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				projectID = p
+				break
+			}
+		}
+	}
+
+	bodyPayload := map[string]interface{}{}
+	if projectID != "" {
+		bodyPayload["projectId"] = projectID
+	}
+	doFetch := func(payload map[string]interface{}, withProjectHeaders bool) (int, []byte, http.Header, error) {
+		bodyBytes, _ := json.Marshal(payload)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels", bytes.NewReader(bodyBytes))
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		req.Header.Set("User-Agent", "antigravity/1.104.0 darwin/arm64")
+		if withProjectHeaders && projectID != "" {
+			req.Header.Set("X-Goog-User-Project", projectID)
+			req.Header.Set("X-Goog-Project-Id", projectID)
+		}
+		resp, err := pf.client.Do(req)
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+		return resp.StatusCode, body, resp.Header, nil
+	}
+
+	statusCode, body, headers, err := doFetch(bodyPayload, true)
 	if err != nil {
 		return nil, err
 	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels", bytes.NewReader([]byte("{}")))
-	if err != nil {
-		return nil, err
+	if shouldRetryAntigravityWithoutProjectID(statusCode, body) {
+		statusCode, body, headers, err = doFetch(map[string]interface{}{}, false)
+		if err != nil {
+			return nil, err
+		}
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("User-Agent", "antigravity/1.104.0 darwin/arm64")
-
-	resp, err := pf.client.Do(req)
-	if err != nil {
-		return nil, err
+	if statusCode == http.StatusTooManyRequests {
+		return nil, rateLimitErrorFromHeaders(headers, "antigravity rate limit")
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, rateLimitErrorFromHeaders(resp.Header, "antigravity rate limit")
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("antigravity status %d", resp.StatusCode)
+	if statusCode != http.StatusOK {
+		diag := ""
+		if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
+			if scope, exp := fetchGoogleTokenInfo(ctx, pf.client, accessToken); scope != "" || exp != "" {
+				diag = fmt.Sprintf(" tokeninfo(scope=%s exp=%s)", scope, exp)
+			}
+		}
+		return nil, fmt.Errorf("antigravity status %d: %s%s", statusCode, strings.TrimSpace(string(body)), diag)
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
 	var payload map[string]interface{}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, err
+	}
+	if os.Getenv("QUOTAGUARD_COLLECTOR_DEBUG") == "1" {
+		logAntigravityPayload(acc.ID, body)
+	}
+
+	if quota := antigravityQuotaFromGroups(acc, payload); quota != nil {
+		return quota, nil
 	}
 
 	remainingFraction, resetAt, ok := parseQuotaFraction(payload)
@@ -313,7 +443,27 @@ func (pf *ProviderFetcher) fetchAntigravity(ctx context.Context, acc *models.Acc
 	limit := int64(100)
 	remaining := int64(remainingPct)
 	used := limit - remaining
-	return quotaFromNumbers(acc, int(limit), int(used), resetAt, 0.8), nil
+	dim := models.Dimension{
+		Name:       "Antigravity (overall)",
+		Type:       models.DimensionSubscription,
+		Limit:      limit,
+		Used:       used,
+		Remaining:  remaining,
+		ResetAt:    resetAt,
+		Semantics:  models.WindowFixed,
+		Source:     models.SourcePolling,
+		Confidence: 0.8,
+	}
+	quota := models.NewQuotaInfo()
+	quota.Provider = acc.Provider
+	quota.AccountID = acc.ID
+	quota.Tier = acc.Tier
+	quota.Dimensions = models.DimensionSlice{dim}
+	quota.Source = models.SourcePolling
+	quota.Confidence = 0.8
+	quota.CollectedAt = time.Now()
+	quota.UpdateEffective()
+	return quota, nil
 }
 
 func (pf *ProviderFetcher) refreshGoogleAccessToken(ctx context.Context, clientID, clientSecret, refreshToken string) (string, error) {
@@ -340,7 +490,8 @@ func (pf *ProviderFetcher) refreshGoogleAccessToken(ctx context.Context, clientI
 		return "", rateLimitErrorFromHeaders(resp.Header, "google oauth rate limit")
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("oauth status %d", resp.StatusCode)
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return "", fmt.Errorf("oauth status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
 	}
 
 	var parsed struct {
@@ -355,17 +506,33 @@ func (pf *ProviderFetcher) refreshGoogleAccessToken(ctx context.Context, clientI
 	return parsed.AccessToken, nil
 }
 
+func shouldRetryAntigravityWithoutProjectID(statusCode int, body []byte) bool {
+	if statusCode != http.StatusBadRequest {
+		return false
+	}
+	text := strings.ToLower(string(body))
+	return strings.Contains(text, `unknown name "projectid"`) ||
+		strings.Contains(text, `unknown name \"projectid\"`) ||
+		strings.Contains(text, "cannot find field")
+}
+
 // ---------------- Gemini (OAuth Soft Probe) ----------------
 
 func (pf *ProviderFetcher) fetchGemini(ctx context.Context, acc *models.Account, creds *models.AccountCredentials) (*models.QuotaInfo, error) {
-	accessToken, err := pf.ensureOAuthToken(ctx, acc.ID, creds, "https://oauth2.googleapis.com/token")
-	if err != nil {
-		return nil, err
-	}
-
 	rawProjectID := strings.TrimSpace(creds.ProjectID)
 	if rawProjectID == "" {
+		if fallbackEnabled() {
+			return geminiEstimatedQuota(acc), nil
+		}
 		return nil, fmt.Errorf("missing gemini project_id")
+	}
+
+	accessToken, err := pf.ensureOAuthToken(ctx, acc.ID, creds, "https://oauth2.googleapis.com/token")
+	if err != nil {
+		if fallbackEnabled() {
+			return geminiEstimatedQuota(acc), nil
+		}
+		return nil, err
 	}
 	projectIDs := []string{rawProjectID}
 	if strings.Contains(rawProjectID, ",") {
@@ -432,7 +599,13 @@ func (pf *ProviderFetcher) fetchGemini(ctx context.Context, acc *models.Account,
 	}
 
 	if lastErr != nil {
+		if fallbackEnabled() {
+			return geminiEstimatedQuota(acc), nil
+		}
 		return nil, lastErr
+	}
+	if fallbackEnabled() {
+		return geminiEstimatedQuota(acc), nil
 	}
 	return nil, fmt.Errorf("gemini request failed")
 }
@@ -703,6 +876,481 @@ func nextMidnightUTC() *time.Time {
 	return &next
 }
 
+type antigravityModelQuota struct {
+	Label             string
+	Model             string
+	RemainingFraction float64
+	ResetAt           *time.Time
+}
+
+func antigravityQuotaFromGroups(acc *models.Account, payload map[string]interface{}) *models.QuotaInfo {
+	modelsQuota := parseAntigravityModelQuotas(payload)
+	if len(modelsQuota) == 0 {
+		return nil
+	}
+
+	type groupStat struct {
+		remainingFraction float64
+		resetAt           *time.Time
+		found             bool
+	}
+
+	groupOrder := []string{
+		"Gemini 3 Pro (High/Low)",
+		"Gemini 3 Flash",
+		"Claude 4.5 + Opus 4.5 + GPT OSS 120",
+	}
+	groups := map[string]*groupStat{
+		"Gemini 3 Pro (High/Low)":             {remainingFraction: 1.0},
+		"Gemini 3 Flash":                      {remainingFraction: 1.0},
+		"Claude 4.5 + Opus 4.5 + GPT OSS 120": {remainingFraction: 1.0},
+	}
+
+	for _, mq := range modelsQuota {
+		group, ok := antigravityGroupFor(mq.Label, mq.Model)
+		if os.Getenv("QUOTAGUARD_COLLECTOR_DEBUG") == "1" {
+			log.Printf("antigravity: account=%s model label=%q model=%q group=%q matched=%t", acc.ID, mq.Label, mq.Model, group, ok)
+		}
+		if !ok {
+			continue
+		}
+		stat := groups[group]
+		if !stat.found || mq.RemainingFraction < stat.remainingFraction {
+			stat.remainingFraction = mq.RemainingFraction
+		}
+		if mq.ResetAt != nil {
+			if stat.resetAt == nil || mq.ResetAt.Before(*stat.resetAt) {
+				t := *mq.ResetAt
+				stat.resetAt = &t
+			}
+		}
+		stat.found = true
+	}
+
+	dims := make([]models.Dimension, 0, len(groups))
+	for _, name := range groupOrder {
+		stat := groups[name]
+		if !stat.found {
+			continue
+		}
+		remainingPct := stat.remainingFraction * 100
+		if remainingPct < 0 {
+			remainingPct = 0
+		}
+		if remainingPct > 100 {
+			remainingPct = 100
+		}
+		limit := int64(100)
+		remaining := int64(remainingPct)
+		used := limit - remaining
+		dims = append(dims, models.Dimension{
+			Name:       name,
+			Type:       models.DimensionSubscription,
+			Limit:      limit,
+			Used:       used,
+			Remaining:  remaining,
+			ResetAt:    stat.resetAt,
+			Semantics:  models.WindowFixed,
+			Source:     models.SourcePolling,
+			Confidence: 0.75,
+		})
+	}
+
+	if len(dims) == 0 {
+		return nil
+	}
+
+	quota := models.NewQuotaInfo()
+	quota.Provider = acc.Provider
+	quota.AccountID = acc.ID
+	quota.Tier = acc.Tier
+	quota.Dimensions = dims
+	quota.Source = models.SourcePolling
+	quota.Confidence = 0.75
+	quota.CollectedAt = time.Now()
+	quota.UpdateEffective()
+	return quota
+}
+
+func antigravityExtractLabelModel(cfg map[string]interface{}) (string, string) {
+	label := readString(cfg["label"])
+	if label == "" {
+		label = readString(cfg["displayName"])
+	}
+	if label == "" {
+		label = readString(cfg["display_name"])
+	}
+	if label == "" {
+		label = readString(cfg["name"])
+	}
+
+	model := ""
+	if mo, ok := cfg["modelOrAlias"].(map[string]interface{}); ok {
+		model = readString(mo["model"])
+		if model == "" {
+			model = readString(mo["alias"])
+		}
+	}
+	if model == "" {
+		model = readString(cfg["model"])
+	}
+	if model == "" {
+		model = readString(cfg["modelId"])
+	}
+	if model == "" {
+		model = readString(cfg["id"])
+	}
+	if model == "" {
+		model = readString(cfg["name"])
+	}
+	return label, model
+}
+
+func antigravityExtractQuotaInfo(cfg map[string]interface{}) map[string]interface{} {
+	if q, ok := cfg["quotaInfo"].(map[string]interface{}); ok {
+		return q
+	}
+	if q, ok := cfg["quota_info"].(map[string]interface{}); ok {
+		return q
+	}
+	if q, ok := cfg["quota"].(map[string]interface{}); ok {
+		return q
+	}
+	if q, ok := cfg["quotaStatus"].(map[string]interface{}); ok {
+		return q
+	}
+	if q, ok := cfg["quota_status"].(map[string]interface{}); ok {
+		return q
+	}
+	return nil
+}
+
+func parseAntigravityModelQuotas(payload map[string]interface{}) []antigravityModelQuota {
+	results := make([]antigravityModelQuota, 0)
+	appendQuota := func(label, model string, qinfo map[string]interface{}) {
+		remainingFraction, okRemaining := readFloatOK(qinfo["remainingFraction"])
+		if !okRemaining {
+			remainingFraction, okRemaining = readFloatOK(qinfo["remaining_fraction"])
+		}
+		if !okRemaining {
+			remainingFraction, okRemaining = readFloatOK(qinfo["remainingPercent"])
+		}
+		if !okRemaining {
+			remainingFraction, okRemaining = readFloatOK(qinfo["remaining_pct"])
+		}
+		if !okRemaining {
+			remainingFraction, okRemaining = readFloatOK(qinfo["remaining_percentage"])
+		}
+		if !okRemaining {
+			if rem, okRem := readFloatOK(qinfo["remaining"]); okRem {
+				if lim, okLim := readFloatOK(qinfo["limit"]); okLim && lim > 0 {
+					remainingFraction = rem / lim
+					okRemaining = true
+				}
+			}
+		}
+		if !okRemaining {
+			return
+		}
+		if remainingFraction > 1 {
+			remainingFraction = remainingFraction / 100
+		}
+		resetAt := parseResetTime(readString(qinfo["resetTime"]))
+		if resetAt == nil {
+			resetAt = parseResetTime(readString(qinfo["reset_time"]))
+		}
+		results = append(results, antigravityModelQuota{
+			Label:             label,
+			Model:             model,
+			RemainingFraction: remainingFraction,
+			ResetAt:           resetAt,
+		})
+	}
+	appendFromMap := func(cfg map[string]interface{}) {
+		qinfo := antigravityExtractQuotaInfo(cfg)
+		if len(qinfo) == 0 {
+			return
+		}
+		label, model := antigravityExtractLabelModel(cfg)
+		if label == "" && model == "" {
+			return
+		}
+		appendQuota(label, model, qinfo)
+	}
+	var walk func(v interface{})
+	walk = func(v interface{}) {
+		switch t := v.(type) {
+		case map[string]interface{}:
+			appendFromMap(t)
+			if modelsMap, ok := t["models"].(map[string]interface{}); ok {
+				for key, raw := range modelsMap {
+					cfg, ok := raw.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					label, model := antigravityExtractLabelModel(cfg)
+					if model == "" {
+						model = key
+					}
+					qinfo := antigravityExtractQuotaInfo(cfg)
+					if len(qinfo) == 0 {
+						continue
+					}
+					appendQuota(label, model, qinfo)
+				}
+			}
+			if modelsArr, ok := t["models"].([]interface{}); ok {
+				for _, raw := range modelsArr {
+					cfg, ok := raw.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					appendFromMap(cfg)
+				}
+			}
+			if modelsArr, ok := t["availableModels"].([]interface{}); ok {
+				for _, raw := range modelsArr {
+					cfg, ok := raw.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					appendFromMap(cfg)
+				}
+			}
+			if modelsArr, ok := t["available_models"].([]interface{}); ok {
+				for _, raw := range modelsArr {
+					cfg, ok := raw.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					appendFromMap(cfg)
+				}
+			}
+			if modelsArr, ok := t["modelConfigs"].([]interface{}); ok {
+				for _, raw := range modelsArr {
+					cfg, ok := raw.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					appendFromMap(cfg)
+				}
+			}
+			if modelsArr, ok := t["model_configs"].([]interface{}); ok {
+				for _, raw := range modelsArr {
+					cfg, ok := raw.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					appendFromMap(cfg)
+				}
+			}
+			if modelsArr, ok := t["availableModelConfigs"].([]interface{}); ok {
+				for _, raw := range modelsArr {
+					cfg, ok := raw.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					appendFromMap(cfg)
+				}
+			}
+			if modelsArr, ok := t["available_model_configs"].([]interface{}); ok {
+				for _, raw := range modelsArr {
+					cfg, ok := raw.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					appendFromMap(cfg)
+				}
+			}
+			if arr, ok := t["clientModelConfigs"].([]interface{}); ok {
+				for _, item := range arr {
+					cfg, ok := item.(map[string]interface{})
+					if !ok {
+						continue
+					}
+					appendFromMap(cfg)
+				}
+			}
+			for _, v2 := range t {
+				walk(v2)
+			}
+		case []interface{}:
+			for _, item := range t {
+				walk(item)
+			}
+		}
+	}
+	walk(payload)
+	return results
+}
+
+func antigravityGroupFor(label, model string) (string, bool) {
+	text := normalizeMatchText(label + " " + model)
+	switch {
+	case strings.Contains(text, "g3p"),
+		(strings.Contains(text, "g3") && strings.Contains(text, "pro")),
+		(strings.Contains(text, "gemini") && strings.Contains(text, "pro")):
+		return "Gemini 3 Pro (High/Low)", true
+	case strings.Contains(text, "g3f"),
+		(strings.Contains(text, "g3") && strings.Contains(text, "flash")),
+		(strings.Contains(text, "gemini") && strings.Contains(text, "flash")):
+		return "Gemini 3 Flash", true
+	case strings.Contains(text, "sonnet"),
+		strings.Contains(text, "opus"),
+		(strings.Contains(text, "claude") && strings.Contains(text, "4 5")),
+		(strings.Contains(text, "claude") && strings.Contains(text, "45")),
+		(strings.Contains(text, "claude") && strings.Contains(text, "sonnet")):
+		return "Claude 4.5 + Opus 4.5 + GPT OSS 120", true
+	case strings.Contains(text, "gpt") && strings.Contains(text, "oss") && strings.Contains(text, "120"):
+		return "Claude 4.5 + Opus 4.5 + GPT OSS 120", true
+	case strings.Contains(text, "gpt oss 120"):
+		return "Claude 4.5 + Opus 4.5 + GPT OSS 120", true
+	}
+	return "", false
+}
+
+func normalizeMatchText(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return value
+	}
+	var sb strings.Builder
+	sb.Grow(len(value))
+	lastSpace := false
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			sb.WriteRune(r)
+			lastSpace = false
+			continue
+		}
+		if !lastSpace {
+			sb.WriteByte(' ')
+			lastSpace = true
+		}
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+func antigravityCandidateSecrets(current string) []string {
+	current = strings.TrimSpace(current)
+	if current != "" {
+		return []string{current}
+	}
+	seen := map[string]struct{}{}
+	candidates := make([]string, 0, 4)
+	add := func(v string) {
+		v = strings.TrimSpace(v)
+		if _, ok := seen[v]; ok {
+			return
+		}
+		seen[v] = struct{}{}
+		candidates = append(candidates, v)
+	}
+	add("")
+	add(os.Getenv("QUOTAGUARD_ANTIGRAVITY_OAUTH_CLIENT_SECRET"))
+	add(os.Getenv("QUOTAGUARD_GOOGLE_CLIENT_SECRET"))
+	for _, part := range strings.Split(os.Getenv("QUOTAGUARD_GOOGLE_CLIENT_SECRET_CANDIDATES"), ",") {
+		add(part)
+	}
+	return candidates
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func logAntigravityPayload(accountID string, body []byte) {
+	if len(body) == 0 {
+		return
+	}
+	const maxBytes = 8192
+	if len(body) > maxBytes {
+		body = body[:maxBytes]
+	}
+	log.Printf("antigravity: account=%s payload=%s", accountID, strings.TrimSpace(string(body)))
+}
+
+func readString(v interface{}) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	default:
+		return ""
+	}
+}
+
+func readFloatOK(v interface{}) (float64, bool) {
+	switch t := v.(type) {
+	case float64:
+		return t, true
+	case float32:
+		return float64(t), true
+	case int:
+		return float64(t), true
+	case int64:
+		return float64(t), true
+	case json.Number:
+		if f, err := t.Float64(); err == nil {
+			return f, true
+		}
+	case string:
+		value := strings.TrimSpace(t)
+		if value == "" {
+			return 0, false
+		}
+		value = strings.ReplaceAll(value, "%", "")
+		value = strings.ReplaceAll(value, ",", ".")
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return 0, false
+		}
+		if f, err := strconv.ParseFloat(value, 64); err == nil {
+			return f, true
+		}
+	}
+	return 0, false
+}
+
+func fallbackEnabled() bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv("QUOTAGUARD_GEMINI_FALLBACK")))
+	return value == "" || value == "1" || value == "true" || value == "on" || value == "static" || value == "lite"
+}
+
+func geminiEstimatedQuota(acc *models.Account) *models.QuotaInfo {
+	limit := 1500
+	remaining := 1500
+	resetAt := nextMidnightUTC()
+
+	dim := models.Dimension{
+		Name:       "Gemini CLI (estimated)",
+		Type:       models.DimensionRPD,
+		Limit:      int64(limit),
+		Used:       0,
+		Remaining:  int64(remaining),
+		ResetAt:    resetAt,
+		Semantics:  models.WindowFixed,
+		Source:     models.SourceEstimated,
+		Confidence: 0.2,
+	}
+
+	quota := models.NewQuotaInfo()
+	quota.Provider = acc.Provider
+	quota.AccountID = acc.ID
+	quota.Tier = acc.Tier
+	quota.Dimensions = models.DimensionSlice{dim}
+	quota.Source = models.SourceEstimated
+	quota.Confidence = 0.2
+	quota.CollectedAt = time.Now()
+	quota.UpdateEffective()
+	return quota
+}
+
 func (pf *ProviderFetcher) ensureOAuthToken(ctx context.Context, accountID string, creds *models.AccountCredentials, defaultTokenURI string) (string, error) {
 	if creds == nil {
 		return "", fmt.Errorf("missing oauth credentials")
@@ -749,7 +1397,8 @@ func (pf *ProviderFetcher) ensureOAuthToken(ctx context.Context, accountID strin
 		return "", rateLimitErrorFromHeaders(resp.Header, "oauth rate limit")
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("oauth status %d", resp.StatusCode)
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return "", fmt.Errorf("oauth status %d: %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes)))
 	}
 
 	var parsed struct {
@@ -807,6 +1456,41 @@ func rateLimitErrorFromHeaders(headers http.Header, msg string) *RateLimitError 
 	return &RateLimitError{RetryAfter: retryAfter, Message: msg}
 }
 
+type httpDoer interface {
+	Do(req *http.Request) (*http.Response, error)
+}
+
+func fetchGoogleTokenInfo(ctx context.Context, client httpDoer, accessToken string) (string, string) {
+	if client == nil || accessToken == "" {
+		return "", ""
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://oauth2.googleapis.com/tokeninfo?access_token="+url.QueryEscape(accessToken), nil)
+	if err != nil {
+		return "", ""
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", ""
+	}
+	var payload struct {
+		Scope     string `json:"scope"`
+		ExpiresIn string `json:"expires_in"`
+		Exp       string `json:"exp"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return "", ""
+	}
+	exp := payload.ExpiresIn
+	if exp == "" {
+		exp = payload.Exp
+	}
+	return strings.TrimSpace(payload.Scope), strings.TrimSpace(exp)
+}
+
 func headerFirst(headers http.Header, keys ...string) string {
 	for _, k := range keys {
 		if v := headers.Get(k); v != "" {
@@ -825,7 +1509,51 @@ func parseInt(value string) int {
 	return n
 }
 
+func parseUnixTimePtr(value interface{}) *time.Time {
+	switch v := value.(type) {
+	case float64:
+		if v <= 0 {
+			return nil
+		}
+		t := time.Unix(int64(v), 0)
+		return &t
+	case int64:
+		if v <= 0 {
+			return nil
+		}
+		t := time.Unix(v, 0)
+		return &t
+	case int:
+		if v <= 0 {
+			return nil
+		}
+		t := time.Unix(int64(v), 0)
+		return &t
+	case json.Number:
+		if n, err := v.Int64(); err == nil && n > 0 {
+			t := time.Unix(n, 0)
+			return &t
+		}
+	case string:
+		if v == "" {
+			return nil
+		}
+		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n > 0 {
+			t := time.Unix(n, 0)
+			return &t
+		}
+	}
+	return nil
+}
+
 func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func maxInt64(a, b int64) int64 {
 	if a > b {
 		return a
 	}
