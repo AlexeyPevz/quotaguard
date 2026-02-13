@@ -30,6 +30,7 @@
 - `QUOTAGUARD_ANTIGRAVITY_OAUTH_CLIENT_SECRET`
 - `QUOTAGUARD_GEMINI_OAUTH_CLIENT_ID`
 - `QUOTAGUARD_GEMINI_OAUTH_CLIENT_SECRET`
+- `QUOTAGUARD_PUBLIC_BASE_URL` (опционально, для callback relay без SSH tunnel)
 
 Запуск:
 
@@ -48,17 +49,39 @@
 - `Settings` — reload/import/export/account checks.
 - `Connect accounts` — OAuth login поток в Telegram.
 
-## 4. OAuth login прямо из Telegram
+## 4. Login прямо из Telegram
 
 Поток:
 1. Выбрать provider в `Connect accounts`.
-2. Нажать кнопку открытия OAuth URL.
-3. После редиректа отправить полный callback URL в чат.
-4. Бот завершит exchange и создаст/обновит account+credentials.
+2. Следовать шагам для выбранного провайдера.
+3. После завершения бот автоматически создаст/обновит account+credentials и отправит подтверждение в чат.
 
-Поддерживаемые провайдеры для этого потока:
-- `antigravity`
-- `gemini`
+### `antigravity` / `gemini`
+
+1. Нажать кнопку открытия OAuth URL.
+2. Пройти login в браузере.
+3. Бот автоматически импортирует auth после callback.
+
+Примечание:
+- client_id/client_secret можно задать через ENV,
+- если ENV отсутствуют, QuotaGuard пытается взять их из локальных auth JSON (`QUOTAGUARD_CLIPROXY_AUTH_PATH`, `/opt/cliproxyplus/auths`, `~/.config/gcloud/...`).
+- при заданном `QUOTAGUARD_PUBLIC_BASE_URL` callback идёт через QuotaGuard API (`/oauth/callback/:provider`) и SSH tunnel обычно не нужен.
+- без `QUOTAGUARD_PUBLIC_BASE_URL` для localhost-callback на другом устройстве может понадобиться SSH tunnel (зависит от provider flow).
+
+### `codex`
+
+1. Бот запускает device-auth на хосте QuotaGuard.
+2. В чате приходит ссылка и one-time code.
+3. После авторизации в браузере QuotaGuard автоматически импортирует токены из `~/.codex/auth.json`.
+4. В чат приходит подтверждение подключения.
+
+### `claude` / `claude-code`
+
+Подключение идёт через встроенный `cliproxyapi` OAuth flow (`-claude-login`) с авто-импортом результата.
+
+### `qwen`
+
+Подключение идёт через встроенный `cliproxyapi` OAuth flow (`-qwen-login`) с авто-импортом результата.
 
 ## 5. Интеграция в существующий бот (командный режим)
 

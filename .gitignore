@@ -6,9 +6,12 @@ data/
 *.db
 *.db-*
 
-# Logs
+# Logs / runtime artifacts
 *.log
 nohup.out
+logs/
+quotaguard.out
+*.pid
 
 # Coverage
 coverage.out

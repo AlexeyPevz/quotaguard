@@ -9,6 +9,8 @@ QuotaGuard — маршрутизатор LLM-запросов по квотам
 Готово и работает:
 - Авто-дискавери аккаунтов из CLIProxy auths.
 - Сбор квот `codex`, `antigravity`, `gemini` (gemini в режиме estimated).
+- Импорт `claude/claude-code` auths (сейчас в режиме estimated-квоты).
+- Telegram login flow: `codex`, `antigravity`, `gemini`, `claude`, `qwen` (авто-подключение после авторизации).
 - Роутинг с порогами, fallback-цепочками, анти-флаппингом.
 - Исключение `estimated` аккаунтов из роутинга (`router.ignore_estimated: true`).
 - Telegram UX для standalone-бота: меню, кнопки, действия по аккаунтам.
@@ -58,7 +60,7 @@ make build
 - Кнопочное меню (status/routing/settings/accounts/login).
 - Временное отключение аккаунтов от роутинга.
 - Настройка порогов/политики/fallback.
-- Логин новых аккаунтов через OAuth URL + callback в чат.
+- Логин новых аккаунтов через OAuth URL с авто-callback (public relay) и авто-подключением.
 
 ### Режим B: встраивание в существующий бот
 
@@ -109,6 +111,7 @@ make build
 - `QUOTAGUARD_ANTIGRAVITY_OAUTH_CLIENT_SECRET`
 - `QUOTAGUARD_GEMINI_OAUTH_CLIENT_ID`
 - `QUOTAGUARD_GEMINI_OAUTH_CLIENT_SECRET`
+- `QUOTAGUARD_PUBLIC_BASE_URL` (опционально; для callback relay без SSH tunnel)
 - `GEMINI_OAUTH_PATH`
 - `QWEN_OAUTH_PATH`
 

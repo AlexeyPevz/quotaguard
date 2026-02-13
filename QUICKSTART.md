@@ -67,6 +67,7 @@ curl -s http://127.0.0.1:8318/health
 2. В `Accounts` проверьте, что видны аккаунты из CLIProxy.
 3. Убедитесь, что нет `config-only` аккаунтов.
 4. Проверьте, что `gemini` помечен как estimated (если так настроено).
+5. Для `claude/claude-code` auths на beta ожидается `estimated`-квота.
 
 ## 7. Проверка роутинга
 

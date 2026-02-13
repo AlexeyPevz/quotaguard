@@ -77,6 +77,12 @@ export QUOTAGUARD_COLLECTOR_JITTER=250ms
 - аккаунты codex импортированы из CLIProxy auths,
 - квота обновляется без ручного token-set в большинстве случаев.
 
+## 7.1 Проверка Claude Code
+
+Ожидание:
+- аккаунты `claude` / `claude-code` импортируются из CLIProxy auths,
+- в beta они могут отображаться как `estimated` (это допустимо).
+
 ## 8. Telegram login flow
 
 Для новых аккаунтов:
