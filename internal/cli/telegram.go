@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -372,21 +373,39 @@ func setupTelegramBot(cfg *config.Config, settings store.SettingsStore, s store.
 
 	api.SetOAuthCallbackHandler(func(c *gin.Context) {
 		sid := strings.TrimSpace(c.Query("sid"))
-		if sid == "" {
-			c.Data(http.StatusBadRequest, "text/html; charset=utf-8", []byte(renderOAuthRelayPage("Missing session", "Login session id is missing. Start login again from Telegram.")))
-			return
-		}
+		requestedProvider := normalizeLoginProvider(c.Param("provider"))
+
+		var (
+			session *deviceAuthSession
+			ok      bool
+		)
 
 		deviceAuthMu.Lock()
-		session, ok := deviceAuthSessions[sid]
+		if sid != "" {
+			session, ok = deviceAuthSessions[sid]
+		}
+		if (session == nil || !ok) && requestedProvider != "" {
+			for _, candidate := range deviceAuthSessions {
+				if candidate == nil {
+					continue
+				}
+				if normalizeLoginProvider(candidate.Provider) != requestedProvider {
+					continue
+				}
+				if session == nil || candidate.CreatedAt.After(session.CreatedAt) {
+					session = candidate
+					ok = true
+				}
+			}
+		}
 		deviceAuthMu.Unlock()
+
 		if !ok || session == nil {
 			c.Data(http.StatusNotFound, "text/html; charset=utf-8", []byte(renderOAuthRelayPage("Session not found", "This login session is no longer active. Start login again from Telegram.")))
 			return
 		}
 
 		expectedProvider := normalizeLoginProvider(session.Provider)
-		requestedProvider := normalizeLoginProvider(c.Param("provider"))
 		if requestedProvider != "" && expectedProvider != "" && requestedProvider != expectedProvider {
 			c.Data(http.StatusBadRequest, "text/html; charset=utf-8", []byte(renderOAuthRelayPage("Provider mismatch", "Callback provider does not match the active session.")))
 			return
@@ -1431,6 +1450,7 @@ func rewriteProviderAuthURLForRelay(authURL, provider, sid string) (string, stri
 	if err != nil {
 		return parsedAuthURL.String(), parsedLocalCallback.String(), false, err
 	}
+	log.Printf("oauth relay redirect configured: provider=%s redirect_uri=%s local_callback=%s", normalizeLoginProvider(provider), publicCallbackURL, parsedLocalCallback.String())
 
 	query.Set("redirect_uri", publicCallbackURL)
 	parsedAuthURL.RawQuery = query.Encode()
@@ -1438,7 +1458,7 @@ func rewriteProviderAuthURLForRelay(authURL, provider, sid string) (string, stri
 	return parsedAuthURL.String(), parsedLocalCallback.String(), true, nil
 }
 
-func buildPublicRelayCallbackURL(baseURL, provider, sid string) (string, error) {
+func buildPublicRelayCallbackURL(baseURL, provider, _ string) (string, error) {
 	parsedBase, err := url.Parse(strings.TrimSpace(baseURL))
 	if err != nil || parsedBase == nil || parsedBase.Scheme == "" || parsedBase.Host == "" {
 		return "", fmt.Errorf("QUOTAGUARD_PUBLIC_BASE_URL must be an absolute URL")
@@ -1452,9 +1472,9 @@ func buildPublicRelayCallbackURL(baseURL, provider, sid string) (string, error) 
 	basePath := strings.TrimRight(parsedBase.Path, "/")
 	parsedBase.Path = fmt.Sprintf("%s%s/%s", basePath, oauthRelayCallbackPath, provider)
 
-	query := parsedBase.Query()
-	query.Set("sid", strings.TrimSpace(sid))
-	parsedBase.RawQuery = query.Encode()
+	// Keep redirect URI deterministic for OAuth providers that require exact callback match
+	// in provider console (notably Google OAuth for Antigravity/Gemini).
+	parsedBase.RawQuery = ""
 	return parsedBase.String(), nil
 }
 

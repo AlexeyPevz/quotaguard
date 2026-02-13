@@ -32,6 +32,14 @@
 - `QUOTAGUARD_GEMINI_OAUTH_CLIENT_SECRET`
 - `QUOTAGUARD_PUBLIC_BASE_URL` (опционально, для callback relay без SSH tunnel)
 
+Google OAuth redirect URI (важно для `antigravity`):
+- если используете public relay (`QUOTAGUARD_PUBLIC_BASE_URL`), в Google Console добавьте:
+  - `<QUOTAGUARD_PUBLIC_BASE_URL>/oauth/callback/antigravity`
+- если relay не используете, redirect URI по умолчанию:
+  - `http://localhost:1456/oauth-callback`
+
+Примечание: URI должен совпадать *точно*, без динамических query-параметров.
+
 Запуск:
 
 ```bash

@@ -117,7 +117,7 @@ func TestRewriteProviderAuthURLForRelay(t *testing.T) {
 	parsed, err := url.Parse(rewritten)
 	require.NoError(t, err)
 	redirectURI := parsed.Query().Get("redirect_uri")
-	require.Equal(t, "https://relay.example.com/base/oauth/callback/gemini?sid=sid-123", redirectURI)
+	require.Equal(t, "https://relay.example.com/base/oauth/callback/gemini", redirectURI)
 }
 
 func TestBuildLocalOAuthCallbackForwardURL(t *testing.T) {
