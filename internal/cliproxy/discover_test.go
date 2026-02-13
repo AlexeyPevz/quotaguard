@@ -37,6 +37,14 @@ func TestDiscoverAuthFiles(t *testing.T) {
 			content:  `{"access_token":"token3","email":"test3@example.com","type":"gemini"}`,
 		},
 		{
+			filename: "claude-test@example.com.json",
+			content:  `{"access_token":"token4","email":"test4@example.com","type":"claude"}`,
+		},
+		{
+			filename: "qwen-test@example.com.json",
+			content:  `{"access_token":"token5","email":"test5@example.com","type":"qwen"}`,
+		},
+		{
 			filename: "invalid.json",
 			content:  `{"not_an_auth_file":true}`,
 		},
@@ -55,8 +63,8 @@ func TestDiscoverAuthFiles(t *testing.T) {
 	auths, err := DiscoverAuthFiles(tmpDir)
 	require.NoError(t, err)
 
-	// Should find 3 valid auth files
-	assert.Len(t, auths, 3)
+	// Should find 5 valid auth files
+	assert.Len(t, auths, 5)
 	for _, auth := range auths {
 		assert.NotEmpty(t, auth.Path)
 	}
@@ -123,6 +131,32 @@ func TestConvertToAccount(t *testing.T) {
 				Priority: 70,
 			},
 		},
+		{
+			name: "claude to anthropic",
+			auth: AuthFile{
+				Email: "user@anthropic.com",
+				Type:  "claude",
+			},
+			expected: &models.Account{
+				ID:       "claude_user_at_anthropic_com",
+				Provider: models.ProviderAnthropic,
+				Enabled:  true,
+				Priority: 90,
+			},
+		},
+		{
+			name: "qwen to qwen",
+			auth: AuthFile{
+				Email: "user@qwen.ai",
+				Type:  "qwen",
+			},
+			expected: &models.Account{
+				ID:       "qwen_user_at_qwen_ai",
+				Provider: models.ProviderQwen,
+				Enabled:  true,
+				Priority: 60,
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -138,12 +172,12 @@ func TestConvertToAccount(t *testing.T) {
 
 func TestConvertToCredentialsExpiry(t *testing.T) {
 	auth := AuthFile{
-		Email:      "test@example.com",
-		Type:       "antigravity",
-		Timestamp:  1700000000000,
-		ExpiresIn:  3600,
+		Email:       "test@example.com",
+		Type:        "antigravity",
+		Timestamp:   1700000000000,
+		ExpiresIn:   3600,
 		AccessToken: "token",
-		Path:       "/tmp/auth.json",
+		Path:        "/tmp/auth.json",
 	}
 	creds := ConvertToCredentials(auth)
 	require.Equal(t, auth.Timestamp+auth.ExpiresIn*1000, creds.ExpiryDateMs)

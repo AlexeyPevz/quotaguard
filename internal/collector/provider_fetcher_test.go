@@ -1,10 +1,13 @@
 package collector
 
 import (
+	"context"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/quotaguard/quotaguard/internal/models"
+	"github.com/quotaguard/quotaguard/internal/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -66,4 +69,27 @@ func TestShouldRetryAntigravityWithoutProjectID(t *testing.T) {
 	require.True(t, shouldRetryAntigravityWithoutProjectID(http.StatusBadRequest, body))
 	require.False(t, shouldRetryAntigravityWithoutProjectID(http.StatusUnauthorized, body))
 	require.False(t, shouldRetryAntigravityWithoutProjectID(http.StatusBadRequest, []byte(`{"error":"other"}`)))
+}
+
+func TestFetchQuota_ClaudeEstimated(t *testing.T) {
+	s := store.NewMemoryStore()
+	acc := &models.Account{
+		ID:       "claude_user_at_example_com",
+		Provider: models.ProviderAnthropic,
+		Enabled:  true,
+	}
+	s.SetAccount(acc)
+	err := s.SetAccountCredentials(acc.ID, &models.AccountCredentials{
+		Type:        "claude",
+		AccessToken: "test-token",
+		UpdatedAt:   time.Now(),
+	})
+	require.NoError(t, err)
+
+	pf := NewProviderFetcher(s)
+	quota, err := pf.FetchQuota(context.Background(), acc.ID)
+	require.NoError(t, err)
+	require.NotNil(t, quota)
+	require.Equal(t, models.SourceEstimated, quota.Source)
+	require.Equal(t, models.DimensionSubscription, quota.Dimensions[0].Type)
 }
