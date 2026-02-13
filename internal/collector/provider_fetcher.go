@@ -52,6 +52,11 @@ func (pf *ProviderFetcher) FetchQuota(ctx context.Context, accountID string) (*m
 		return pf.fetchAntigravity(ctx, acc, creds)
 	case "gemini":
 		return pf.fetchGemini(ctx, acc, creds)
+	case "claude", "claude-code", "claude_code":
+		if strings.TrimSpace(creds.SessionToken) == "" && strings.TrimSpace(creds.AccessToken) == "" {
+			return nil, fmt.Errorf("missing claude auth token")
+		}
+		return claudeEstimatedQuota(acc), nil
 	case "qwen", "dashscope":
 		return pf.fetchQwen(ctx, acc, creds)
 	default:
@@ -1346,6 +1351,33 @@ func geminiEstimatedQuota(acc *models.Account) *models.QuotaInfo {
 	quota.Dimensions = models.DimensionSlice{dim}
 	quota.Source = models.SourceEstimated
 	quota.Confidence = 0.2
+	quota.CollectedAt = time.Now()
+	quota.UpdateEffective()
+	return quota
+}
+
+func claudeEstimatedQuota(acc *models.Account) *models.QuotaInfo {
+	limit := 100
+	remaining := 100
+
+	dim := models.Dimension{
+		Name:       "Claude Code subscription (estimated)",
+		Type:       models.DimensionSubscription,
+		Limit:      int64(limit),
+		Used:       0,
+		Remaining:  int64(remaining),
+		Semantics:  models.WindowUnknown,
+		Source:     models.SourceEstimated,
+		Confidence: 0.15,
+	}
+
+	quota := models.NewQuotaInfo()
+	quota.Provider = acc.Provider
+	quota.AccountID = acc.ID
+	quota.Tier = acc.Tier
+	quota.Dimensions = models.DimensionSlice{dim}
+	quota.Source = models.SourceEstimated
+	quota.Confidence = 0.15
 	quota.CollectedAt = time.Now()
 	quota.UpdateEffective()
 	return quota

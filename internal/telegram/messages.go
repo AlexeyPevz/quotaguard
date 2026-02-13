@@ -230,14 +230,18 @@ func providerOrderIndex(provider string) int {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "antigravity", "cloudcode":
 		return 0
-	case "codex":
+	case "claude", "claude-code", "claude_code":
 		return 1
-	case "gemini":
+	case "codex":
 		return 2
-	case "openai":
+	case "gemini":
 		return 3
-	case "anthropic":
+	case "qwen", "dashscope":
 		return 4
+	case "openai":
+		return 5
+	case "anthropic":
+		return 6
 	default:
 		return 99
 	}
@@ -247,10 +251,14 @@ func providerTitle(provider string) string {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "antigravity", "cloudcode":
 		return "🛰 antigravity"
+	case "claude", "claude-code", "claude_code":
+		return "🧩 claude"
 	case "codex":
 		return "🧠 codex"
 	case "gemini":
 		return "✨ gemini"
+	case "qwen", "dashscope":
+		return "🌐 qwen"
 	case "openai":
 		return "⚡ openai"
 	case "anthropic":

@@ -49,6 +49,11 @@ var ProviderMapping = map[string]string{
 	"antigravity": string(models.ProviderAnthropic),
 	"codex":       string(models.ProviderOpenAI),
 	"gemini":      string(models.ProviderGemini),
+	"claude":      string(models.ProviderAnthropic),
+	"claude-code": string(models.ProviderAnthropic),
+	"claude_code": string(models.ProviderAnthropic),
+	"qwen":        string(models.ProviderQwen),
+	"dashscope":   string(models.ProviderQwen),
 	"openai":      string(models.ProviderOpenAI),
 	"anthropic":   string(models.ProviderAnthropic),
 }
@@ -124,6 +129,7 @@ func DiscoverAuthFiles(authsPath string) ([]AuthFile, error) {
 		if auth.Type == "" || auth.Email == "" {
 			continue
 		}
+		auth.Type = strings.ToLower(strings.TrimSpace(auth.Type))
 
 		// Normalize nested token fields (CLIProxy often stores OAuth under "token")
 		if auth.AccessToken == "" && auth.Token.AccessToken != "" {
@@ -238,6 +244,8 @@ func getDefaultPriority(provider models.Provider) int {
 		return 80
 	case models.ProviderGemini:
 		return 70
+	case models.ProviderQwen:
+		return 60
 	default:
 		return 50
 	}

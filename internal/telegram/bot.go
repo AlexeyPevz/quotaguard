@@ -259,6 +259,7 @@ type LoginURLPayload struct {
 	Provider     string
 	URL          string
 	State        string
+	Mode         string
 	Instructions string
 }
 

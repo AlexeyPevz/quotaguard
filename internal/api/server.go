@@ -132,6 +132,10 @@ func (s *Server) setupRoutes() {
 	// Health check - NO authentication required
 	s.router.GET("/health", s.handleHealth)
 
+	// OAuth callback relay endpoint - NO authentication required
+	s.router.GET("/oauth/callback", handleOAuthCallback)
+	s.router.GET("/oauth/callback/:provider", handleOAuthCallback)
+
 	// Create auth middleware based on configuration
 	authMiddleware := APIKeyAuth(s.apiConfig.Auth.APIKeys, s.apiConfig.Auth.HeaderName, s.logger)
 

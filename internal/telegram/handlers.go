@@ -19,7 +19,7 @@ func (b *Bot) handleMessage(msg Message) {
 	}
 
 	if session := b.GetSession(msg.ChatID); session != nil && session.State == StateWaitingOAuth {
-		b.handleOAuthCallbackInput(msg.ChatID, text, session)
+		b.handleLoginInput(msg.ChatID, text, session)
 		return
 	}
 
@@ -423,9 +423,8 @@ func (b *Bot) handleAccountCheckTimeout(chatID int64, data string) {
 
 func (b *Bot) handleConnectAccountsMenu(chatID int64) {
 	msg := "➕ <b>Подключение аккаунтов</b>\n\n" +
-		"1) Нажми провайдера\n" +
-		"2) Перейди по ссылке OAuth\n" +
-		"3) После редиректа отправь в этот чат весь callback URL\n\n" +
+		"• Antigravity/Gemini/Claude/Qwen: OAuth URL + авто-callback (через public relay, если настроен)\n" +
+		"• Codex: device auth (ссылка + код)\n\n" +
 		"После успеха аккаунт сразу попадёт в QuotaGuard."
 	b.sendMessageWithKeyboard(chatID, msg, "HTML", connectAccountsMenuKeyboard())
 }
@@ -446,31 +445,166 @@ func (b *Bot) handleAccountLogin(chatID int64, data string) {
 		b.sendErrorMessage(chatID, fmt.Sprintf("Failed to start login: %v", err))
 		return
 	}
-	if payload == nil || payload.URL == "" || payload.State == "" {
-		b.sendErrorMessage(chatID, "Login URL is empty")
+	if payload == nil {
+		b.sendErrorMessage(chatID, "Login payload is empty")
 		return
 	}
-	b.SetSessionState(chatID, StateWaitingOAuth, map[string]interface{}{
-		"provider": provider,
-		"state":    payload.State,
-	})
-
-	msg := fmt.Sprintf(
-		"🔐 <b>Логин: %s</b>\n\n%s\n\nПосле логина пришли сюда callback URL.",
-		html.EscapeString(provider),
-		html.EscapeString(payload.Instructions),
-	)
-	keyboard := InlineKeyboard{
-		Rows: [][]InlineButton{
-			{
-				{Text: "🌐 Открыть OAuth", URL: payload.URL},
-			},
-			{
-				{Text: "⬅️ Назад", CallbackData: menuConnect},
-			},
-		},
+	mode := strings.ToLower(strings.TrimSpace(payload.Mode))
+	if mode == "" {
+		mode = "oauth"
 	}
-	b.sendMessageWithKeyboard(chatID, msg, "HTML", keyboard)
+
+	if mode == "oauth" {
+		if payload.URL == "" || payload.State == "" {
+			b.sendErrorMessage(chatID, "Login URL is empty")
+			return
+		}
+		b.SetSessionState(chatID, StateWaitingOAuth, map[string]interface{}{
+			"provider":   provider,
+			"state":      payload.State,
+			"login_mode": mode,
+		})
+
+		msg := fmt.Sprintf(
+			"🔐 <b>Логин: %s</b>\n\n%s\n\nПосле логина пришли сюда callback URL.",
+			html.EscapeString(provider),
+			html.EscapeString(payload.Instructions),
+		)
+		keyboard := InlineKeyboard{
+			Rows: [][]InlineButton{
+				{
+					{Text: "🌐 Открыть OAuth", URL: payload.URL},
+				},
+				{
+					{Text: "⬅️ Назад", CallbackData: menuConnect},
+				},
+			},
+		}
+		b.sendMessageWithKeyboard(chatID, msg, "HTML", keyboard)
+		return
+	}
+
+	if mode == "token" {
+		b.SetSessionState(chatID, StateWaitingOAuth, map[string]interface{}{
+			"provider":   provider,
+			"state":      payload.State,
+			"login_mode": mode,
+		})
+		msg := fmt.Sprintf(
+			"🔐 <b>Логин: %s</b>\n\n%s\n\nОтправь сюда session token одним сообщением.",
+			html.EscapeString(provider),
+			html.EscapeString(payload.Instructions),
+		)
+		keyboard := InlineKeyboard{
+			Rows: [][]InlineButton{
+				{
+					{Text: "⬅️ Назад", CallbackData: menuConnect},
+				},
+			},
+		}
+		b.sendMessageWithKeyboard(chatID, msg, "HTML", keyboard)
+		return
+	}
+
+	if mode == "device" {
+		msg := fmt.Sprintf(
+			"🔐 <b>Логин: %s</b>\n\n%s\n\nПосле завершения в браузере бот подключит аккаунт автоматически.",
+			html.EscapeString(provider),
+			html.EscapeString(payload.Instructions),
+		)
+		keyboard := InlineKeyboard{
+			Rows: [][]InlineButton{
+				{
+					{Text: "🌐 Открыть авторизацию", URL: payload.URL},
+				},
+				{
+					{Text: "⬅️ Назад", CallbackData: menuConnect},
+				},
+			},
+		}
+		b.sendMessageWithKeyboard(chatID, msg, "HTML", keyboard)
+		return
+	}
+
+	b.sendErrorMessage(chatID, fmt.Sprintf("Unsupported login mode: %s", mode))
+}
+
+func (b *Bot) handleLoginInput(chatID int64, text string, session *UserSession) {
+	mode, _ := session.Data["login_mode"].(string)
+	if strings.EqualFold(mode, "token") {
+		b.handleTokenLoginInput(chatID, text, session)
+		return
+	}
+	if strings.EqualFold(mode, "device") {
+		b.handleDeviceLoginInput(chatID, text, session)
+		return
+	}
+	b.handleOAuthCallbackInput(chatID, text, session)
+}
+
+func (b *Bot) handleDeviceLoginInput(chatID int64, text string, session *UserSession) {
+	if b.onCompleteOAuthLogin == nil {
+		b.sendErrorMessage(chatID, "Login completion callback not configured")
+		b.SetSessionState(chatID, StateIdle, nil)
+		return
+	}
+	provider, _ := session.Data["provider"].(string)
+	state, _ := session.Data["state"].(string)
+	action := strings.TrimSpace(text)
+	if action == "" {
+		b.sendErrorMessage(chatID, "После авторизации отправь `done`")
+		return
+	}
+	result, err := b.onCompleteOAuthLogin(provider, state, action, chatID)
+	if err != nil {
+		b.sendErrorMessage(chatID, fmt.Sprintf("Login failed: %v", err))
+		return
+	}
+	b.SetSessionState(chatID, StateIdle, nil)
+	if result == nil {
+		b.sendMessageWithParseMode(chatID, "✅ Логин завершён.", "HTML")
+		b.handleConnectAccountsMenu(chatID)
+		return
+	}
+	msg := fmt.Sprintf(
+		"✅ <b>Аккаунт подключён</b>\n\n• Provider: <code>%s</code>\n• Email: <code>%s</code>\n• Account: <code>%s</code>",
+		html.EscapeString(result.Provider),
+		html.EscapeString(result.Email),
+		html.EscapeString(result.AccountID),
+	)
+	b.sendMessageWithKeyboard(chatID, msg, "HTML", connectAccountsMenuKeyboard())
+}
+
+func (b *Bot) handleTokenLoginInput(chatID int64, text string, session *UserSession) {
+	if b.onCompleteOAuthLogin == nil {
+		b.sendErrorMessage(chatID, "Login completion callback not configured")
+		b.SetSessionState(chatID, StateIdle, nil)
+		return
+	}
+	provider, _ := session.Data["provider"].(string)
+	token := strings.TrimSpace(text)
+	if token == "" {
+		b.sendErrorMessage(chatID, "Session token пустой")
+		return
+	}
+	result, err := b.onCompleteOAuthLogin(provider, "manual", token, chatID)
+	if err != nil {
+		b.sendErrorMessage(chatID, fmt.Sprintf("Login failed: %v", err))
+		return
+	}
+	b.SetSessionState(chatID, StateIdle, nil)
+	if result == nil {
+		b.sendMessageWithParseMode(chatID, "✅ Логин завершён.", "HTML")
+		b.handleConnectAccountsMenu(chatID)
+		return
+	}
+	msg := fmt.Sprintf(
+		"✅ <b>Аккаунт подключён</b>\n\n• Provider: <code>%s</code>\n• Email: <code>%s</code>\n• Account: <code>%s</code>",
+		html.EscapeString(result.Provider),
+		html.EscapeString(result.Email),
+		html.EscapeString(result.AccountID),
+	)
+	b.sendMessageWithKeyboard(chatID, msg, "HTML", connectAccountsMenuKeyboard())
 }
 
 func (b *Bot) handleOAuthCallbackInput(chatID int64, text string, session *UserSession) {

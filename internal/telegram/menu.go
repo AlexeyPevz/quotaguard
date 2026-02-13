@@ -169,8 +169,15 @@ func connectAccountsMenuKeyboard() InlineKeyboard {
 	return InlineKeyboard{
 		Rows: [][]InlineButton{
 			{
+				{Text: "🧠 Codex", CallbackData: actionLogin + ":codex"},
+				{Text: "🧩 Claude Code", CallbackData: actionLogin + ":claude"},
+			},
+			{
 				{Text: "🛰 Antigravity", CallbackData: actionLogin + ":antigravity"},
 				{Text: "✨ Gemini", CallbackData: actionLogin + ":gemini"},
+			},
+			{
+				{Text: "🌐 Qwen", CallbackData: actionLogin + ":qwen"},
 			},
 			{
 				{Text: "📥 Импорт после логина", CallbackData: actionImport},
